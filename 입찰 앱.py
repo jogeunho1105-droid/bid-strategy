@@ -1,27 +1,29 @@
 # ╔══════════════════════════════════════════════════════════════╗
-# ║    투찰전략 분석 시스템 v1.6 — 흐름 차트 추가              ║
-# ║    건별 상세 카드에 사정율 흐름 + 예측값 시각화            ║
+# ║    투찰전략 분석 시스템 v1.7 — 한글 차트 + 범례 패널       ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import xlrd
-import io
-import os
-import json
+import io, os, json
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-from matplotlib import rcParams
+import matplotlib.font_manager as fm
 from datetime import datetime
 
-rcParams["font.family"] = "DejaVu Sans"
-rcParams["axes.unicode_minus"] = False
+# ── 한글 폰트 설정 ─────────────────────────────────────────────
+FONT_PATH = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
+if os.path.exists(FONT_PATH):
+    fm.fontManager.addfont(FONT_PATH)
+    plt.rcParams["font.family"] = "Noto Sans CJK JP"
+else:
+    plt.rcParams["font.family"] = "DejaVu Sans"
+plt.rcParams["axes.unicode_minus"] = False
 
 st.set_page_config(page_title="투찰전략 분석 시스템", page_icon="📊", layout="wide")
-
 st.markdown("""
 <style>
 .main-header{background:linear-gradient(135deg,#1a2744,#243260);color:white;
@@ -63,9 +65,9 @@ def analyze_pattern(org, df_c):
     coef = float(np.polyfit(np.arange(min(20,n)), sub[-min(20,n):], 1)[0])
     trend   = "↑상승" if coef>0.02 else "↓하락" if coef<-0.02 else "→횡보"
     pattern = "연속성" if ac>0.2 else "반전" if ac<-0.2 else "무작위"
-    if std > 0.60: w5,w10,wm = 0.35,0.30,0.35
+    if std > 0.60:      w5,w10,wm = 0.35,0.30,0.35
     elif abs(ac) > 0.2: w5,w10,wm = 0.50,0.30,0.20
-    else: w5,w10,wm = 0.40,0.35,0.25
+    else:               w5,w10,wm = 0.40,0.35,0.25
     pred = w5*r5 + w10*r10 + wm*mean
     lv = float(sub[-1])
     adj = (lv*abs(ac)*0.2 if pattern=="연속성" else
@@ -74,7 +76,7 @@ def analyze_pattern(org, df_c):
             "autocorr":round(ac,4),"last_val":round(lv,4),
             "r5":round(r5,4),"r10":round(r10,4),"mean":round(mean,4),
             "std":round(std,4),"n":n,
-            "all_vals": sub.tolist(),
+            "all_vals":sub.tolist(),
             "recent10":[round(float(v),4) for v in sub[-10:]]}
 
 def analyze_similar(name, base_원, df_c):
@@ -136,144 +138,224 @@ def parse_xls(file_bytes):
                      "region":row.get("지역","")})
     return bids
 
-# ── 핵심: 흐름 차트 생성 함수 ─────────────────────────────────
+# ── 핵심: 흐름 차트 생성 ──────────────────────────────────────
 def make_flow_chart(a1, a2, a3, lo, hi, org_name):
-    """사정율 흐름 차트 + 3가지 예측값 + 권장구간 시각화"""
-    if not a1 or not a1.get("all_vals"):
-        return None
+    all_v = a1.get("all_vals", [])
+    if not all_v: return None
 
-    all_vals = a1["all_vals"]
-    n_all = len(all_vals)
-    # 최근 30건만 표시
-    show_n = min(30, n_all)
-    recent_vals = all_vals[-show_n:]
-    x = list(range(1, show_n + 1))
-
-    fig, (ax_main, ax_hist) = plt.subplots(
-        2, 1, figsize=(11, 5.5),
-        gridspec_kw={"height_ratios": [3, 1]},
-        facecolor="#f8fafc"
-    )
-
-    # ── 메인 차트 ──────────────────────────────────────────────
-    ax_main.set_facecolor("#ffffff")
-    ax_main.axhline(y=0, color="#94a3b8", lw=1.2, alpha=0.7, zorder=1)
-
-    # 권장구간 배경
-    if lo is not None and hi is not None:
-        ax_main.axhspan(lo, hi, alpha=0.12, color="#7c3aed", zorder=1)
-
-    # 평균선
-    mean_v = a1["mean"]
-    ax_main.axhline(y=mean_v, color="#f59e0b", lw=1.2, ls="--",
-                    alpha=0.8, label=f"전체평균({mean_v:+.3f}%)", zorder=2)
-
-    # 이동평균 (5건)
-    ma5 = pd.Series(recent_vals).rolling(5, min_periods=1).mean().values
-    ax_main.plot(x, ma5, color="#6366f1", lw=1.8, ls="--",
-                 alpha=0.75, label="이동평균(5건)", zorder=3)
-
-    # 막대 (양수=녹색, 음수=빨강)
-    colors = ["#10b981" if v >= 0 else "#ef4444" for v in recent_vals]
-    ax_main.bar(x, recent_vals, color=colors, alpha=0.45, width=0.65, zorder=2)
-
-    # 꺾은선
-    ax_main.plot(x, recent_vals, color="#1a2744", lw=1.6,
-                 marker="o", ms=3.5, zorder=4, label="실제 사정율")
-
-    # 값 라벨 (최근 10건)
-    for i in range(max(0, show_n-10), show_n):
-        v = recent_vals[i]
-        ax_main.annotate(f"{v:+.3f}",
-                         xy=(x[i], v),
-                         xytext=(0, 8 if v >= 0 else -14),
-                         textcoords="offset points",
-                         ha="center", fontsize=7,
-                         color="#10b981" if v >= 0 else "#ef4444",
-                         fontweight="bold")
-
-    # ── 예측값 3개 + 권장구간 표시 ──────────────────────────────
+    show_n = min(30, len(all_v))
+    recent = all_v[-show_n:]
+    x = np.arange(1, show_n+1)
     next_x = show_n + 1
-    ax_main.axvline(x=show_n + 0.5, color="#7c3aed",
-                    lw=1.5, ls=":", alpha=0.8)
 
-    pred_items = []
-    if a1: pred_items.append(("①패턴",  a1["pred"], "#1d4ed8", "D",  11))
-    if a2: pred_items.append(("②유사표본", a2["pred"], "#15803d", "s",  11))
-    if a3: pred_items.append(("③트렌드", a3["pred"], "#854d0e", "^",  11))
+    # ── 레이아웃: 메인(위 70%) + 범례패널(아래 30%) ────────────
+    fig = plt.figure(figsize=(13, 8.5), facecolor="#f8fafc")
+    gs  = fig.add_gridspec(2, 1, height_ratios=[2.8, 1.2], hspace=0.04)
+    ax   = fig.add_subplot(gs[0])
+    ax_l = fig.add_subplot(gs[1])
+    ax.set_facecolor("#ffffff")
+    ax_l.set_facecolor("#f8fafc")
+    ax_l.axis("off")
 
-    offsets = [-0.25, 0, 0.25]
-    for idx, (lbl, pv, pc, mk, ms) in enumerate(pred_items):
-        px = next_x + offsets[idx]
-        ax_main.plot([px], [pv], color=pc, marker=mk,
-                     ms=ms, zorder=6, label=f"{lbl}({pv:+.4f}%)")
-        ax_main.annotate(f"{pv:+.4f}",
-                         xy=(px, pv),
-                         xytext=(18, 0),
-                         textcoords="offset points",
-                         ha="left", fontsize=8,
-                         color=pc, fontweight="bold",
-                         arrowprops=dict(arrowstyle="->", color=pc, lw=1))
+    # ── 0선 ───────────────────────────────────────────────────
+    ax.axhline(0, color="#94a3b8", lw=1.1, alpha=0.8, zorder=1)
 
-    # 권장구간 브라켓
+    # ── 권장구간 배경 ──────────────────────────────────────────
+    mean_v = a1["mean"]
     if lo is not None and hi is not None:
-        ax_main.annotate("",
-                         xy=(next_x + 0.7, lo),
-                         xytext=(next_x + 0.7, hi),
-                         arrowprops=dict(arrowstyle="<->",
-                                         color="#7c3aed", lw=2))
-        mid = (lo + hi) / 2
-        ax_main.text(next_x + 0.9, mid,
-                     f"💡{lo:+.4f}\n  ~{hi:+.4f}",
-                     fontsize=7.5, color="#7c3aed",
-                     fontweight="bold", va="center")
+        ax.axhspan(lo, hi, alpha=0.12, color="#7c3aed", zorder=1)
+        ax.axhline(lo, color="#7c3aed", lw=0.8, ls=":", alpha=0.5, zorder=1)
+        ax.axhline(hi, color="#7c3aed", lw=0.8, ls=":", alpha=0.5, zorder=1)
 
-    ax_main.set_xlim(0.2, next_x + 2.8)
-    trend_color = ("#15803d" if "상승" in a1["trend"]
-                   else "#991b1b" if "하락" in a1["trend"] else "#475569")
-    ax_main.set_title(
-        f"{org_name} — 사정율 흐름 (최근 {show_n}건)   "
-        f"트렌드: {a1['trend']}  |  패턴: {a1['pattern']}  |  "
-        f"자기상관: {a1['autocorr']:+.3f}",
-        fontsize=10, fontweight="bold", color="#1a2744", pad=8
-    )
-    ax_main.set_ylabel("예가/기초(0%) %", fontsize=9)
-    ax_main.legend(loc="upper left", fontsize=8,
-                   framealpha=0.9, ncol=3)
-    ax_main.grid(axis="y", alpha=0.25, ls="--")
-    ax_main.tick_params(labelsize=8)
+    # ── 전체 평균선 ───────────────────────────────────────────
+    ax.axhline(mean_v, color="#f59e0b", lw=1.4, ls="--", alpha=0.85, zorder=2)
 
-    # x축 레이블
-    xticks = list(range(1, show_n+1)) + [next_x]
-    xlabels = [f"-{show_n-i}" for i in range(show_n)] + ["예측"]
-    ax_main.set_xticks(xticks)
-    ax_main.set_xticklabels(xlabels, fontsize=7, rotation=0)
+    # ── 이동평균 MA(5) ────────────────────────────────────────
+    ma5 = [np.mean(recent[max(0,i-4):i+1]) for i in range(show_n)]
+    ax.plot(x, ma5, color="#6366f1", lw=1.8, ls="--", alpha=0.75, zorder=3)
 
-    # ── 히스토그램 ────────────────────────────────────────────
-    ax_hist.set_facecolor("#ffffff")
-    ax_hist.hist(all_vals, bins=25, color="#3b82f6",
-                 alpha=0.55, edgecolor="white")
-    ax_hist.axvline(x=mean_v, color="#f59e0b", lw=2, ls="--")
+    # ── 막대 ─────────────────────────────────────────────────
+    bar_c = ["#10b981" if v >= 0 else "#ef4444" for v in recent]
+    ax.bar(x, recent, color=bar_c, alpha=0.42, width=0.65, zorder=2)
 
-    for lbl, pv, pc, mk, ms in pred_items:
-        ax_hist.axvline(x=pv, color=pc, lw=1.5, ls="-")
+    # ── 꺾은선 ───────────────────────────────────────────────
+    ax.plot(x, recent, color="#1a2744", lw=1.8, marker="o", ms=4.2, zorder=4)
 
+    # ── 최근 10건 값 라벨 ─────────────────────────────────────
+    for i in range(max(0, show_n-10), show_n):
+        v = recent[i]
+        ax.annotate(f"{v:+.3f}",
+                    xy=(x[i], v), xytext=(0, 9 if v>=0 else -14),
+                    textcoords="offset points", ha="center", fontsize=7.5,
+                    color="#059669" if v>=0 else "#dc2626", fontweight="bold")
+
+    # ── 예측 구분선 ───────────────────────────────────────────
+    ax.axvline(show_n+0.5, color="#7c3aed", lw=1.5, ls=":", alpha=0.75)
+
+    # ── 예측 포인트 3개 ───────────────────────────────────────
+    preds = []
+    if a1: preds.append(("①패턴",   a1["pred"], "#1d4ed8", "D", 12))
+    if a2: preds.append(("②유사표본", a2["pred"], "#15803d", "s", 12))
+    if a3: preds.append(("③트렌드",  a3["pred"], "#92400e", "^", 12))
+    xoff = [-0.32, 0.0, 0.32]
+    for idx, (lbl, pv, pc, mk, ms) in enumerate(preds):
+        px = next_x + xoff[idx]
+        ax.plot([px], [pv], color=pc, marker=mk, ms=ms, zorder=7,
+                markeredgecolor="white", markeredgewidth=1.2)
+        ax.annotate(f"{pv:+.4f}%",
+                    xy=(px, pv), xytext=(24, 0),
+                    textcoords="offset points", ha="left",
+                    fontsize=9, color=pc, fontweight="bold",
+                    arrowprops=dict(arrowstyle="->", color=pc, lw=1.2))
+
+    # ── 권장구간 브라켓 ───────────────────────────────────────
+    if lo is not None and hi is not None:
+        bx = next_x + 1.35
+        ax.annotate("", xy=(bx, lo), xytext=(bx, hi),
+                    arrowprops=dict(arrowstyle="<->", color="#7c3aed", lw=2.2))
+        ax.text(bx+0.18, (lo+hi)/2,
+                f"권장\n{lo:+.4f}\n~{hi:+.4f}",
+                fontsize=8.5, color="#7c3aed", fontweight="bold",
+                va="center", ha="left",
+                bbox=dict(boxstyle="round,pad=0.35",
+                          fc="#f3e8ff", ec="#7c3aed", alpha=0.9))
+
+    # ── 우측 보조축 ───────────────────────────────────────────
+    ax_r = ax.twinx()
+    ax_r.set_ylim(ax.get_ylim())
+    ticks = [mean_v]; tlbls = [f"평균:{mean_v:+.3f}"]
     if lo is not None:
-        ax_hist.axvspan(lo, hi, alpha=0.15, color="#7c3aed")
+        ticks += [lo, hi]; tlbls += [f"하한:{lo:+.3f}", f"상한:{hi:+.3f}"]
+    ax_r.set_yticks(ticks)
+    ax_r.set_yticklabels(tlbls, fontsize=7.5, color="#64748b")
 
-    ax_hist.set_xlabel("예가/기초(0%) %", fontsize=8)
-    ax_hist.set_ylabel("빈도", fontsize=8)
-    ax_hist.set_title(f"전체 {n_all}건 분포", fontsize=8, color="#64748b")
-    ax_hist.tick_params(labelsize=7)
-    ax_hist.grid(axis="y", alpha=0.25)
+    # ── 축 설정 ───────────────────────────────────────────────
+    ax.set_xlim(0.3, next_x+2.9)
+    ax.set_xticks(list(x) + [next_x])
+    ax.set_xticklabels([f"-{show_n-i}" for i in range(show_n)] + ["예측"],
+                       fontsize=7.5)
+    ax.set_ylabel("예가/기초(0%) %", fontsize=9)
+    ax.tick_params(labelsize=8)
+    ax.grid(axis="y", alpha=0.18, ls="--")
+    ax.set_title(
+        f"{org_name}  —  최근 {show_n}건  |  "
+        f"트렌드: {a1['trend']}  |  패턴: {a1['pattern']}  |  "
+        f"자기상관: {a1['autocorr']:+.3f}  |  전체 n={a1['n']}",
+        fontsize=10.5, fontweight="bold", color="#1a2744", pad=10)
 
-    plt.tight_layout(pad=0.8)
+    # ════════════════════════════════════════════════════════
+    # ── 하단 범례 + 설명 패널 ────────────────────────────────
+    # ════════════════════════════════════════════════════════
+    ax_l.set_xlim(0, 1); ax_l.set_ylim(0, 1)
+
+    # 전체 패널 배경
+    ax_l.add_patch(mpatches.FancyBboxPatch(
+        (0.005, 0.03), 0.990, 0.94,
+        boxstyle="round,pad=0.01",
+        facecolor="#ffffff", edgecolor="#cbd5e1", linewidth=1.2,
+        transform=ax_l.transAxes))
+
+    # 4열 정의: (x시작, 헤더, 헤더색)
+    col_defs = [
+        (0.01,  "차트 범례",   "#1d4ed8"),
+        (0.265, "예측값",      "#15803d"),
+        (0.515, "패턴 상세",   "#7c3aed"),
+        (0.765, "시장 정보",   "#92400e"),
+    ]
+    # 헤더 렌더링
+    for cx, htxt, hcol in col_defs:
+        # 헤더 배경 바
+        ax_l.add_patch(mpatches.FancyBboxPatch(
+            (cx+0.002, 0.80), 0.238, 0.135,
+            boxstyle="round,pad=0.005",
+            facecolor=hcol, alpha=0.12, edgecolor="none",
+            transform=ax_l.transAxes))
+        ax_l.text(cx+0.012, 0.875, htxt,
+                  fontsize=9.5, fontweight="bold",
+                  color=hcol, va="center",
+                  transform=ax_l.transAxes)
+    # 열 구분선
+    for lx in [0.255, 0.505, 0.755]:
+        ax_l.plot([lx, lx], [0.04, 0.97],
+                  color="#e2e8f0", lw=1.0,
+                  transform=ax_l.transAxes)
+
+    # 아이템 정의
+    items = [
+        # 열1 — 차트 범례 (4개)
+        (0.01, "line", "#1a2744", "",  "실제 낙찰 사정율",   f"최근 {show_n}건 실제 낙찰 결과값"),
+        (0.01, "line", "#6366f1", "",  "이동평균 MA(5)",     "최근 5건 이동평균 추세선"),
+        (0.01, "line", "#f59e0b", "",  "전체 평균선",        f"전체 평균: {mean_v:+.4f}%"),
+        (0.01, "band", "#7c3aed", "",  "권장 투찰 구간",     f"{lo:+.4f}%  ~  {hi:+.4f}%" if lo else "-"),
+        # 열2 — 예측값 (3개)
+        (0.265,"mark", "#1d4ed8", "D", "①패턴 분석",        f"발주처 이력 패턴  →  {a1['pred']:+.4f}%"),
+        (0.265,"mark", "#15803d", "s", "②유사표본 분석",     f"유사용역 {a2['n']}건 표본  →  {a2['pred']:+.4f}%" if a2 else "이력 없음"),
+        (0.265,"mark", "#92400e", "^", "③트렌드 분석",       f"최근 흐름 기반  →  {a3['pred']:+.4f}%" if a3 else "이력 없음"),
+        # 열3 — 패턴 상세 (3개)
+        (0.515,"dot",  "#7c3aed", "",  "최근 5건 평균 (r5)", f"{a1['r5']:+.4f}%"),
+        (0.515,"dot",  "#7c3aed", "",  "최근 10건 평균 (r10)",f"{a1['r10']:+.4f}%"),
+        (0.515,"dot",  "#7c3aed", "",  "직전 낙찰 사정율",   f"{a1['last_val']:+.4f}%"),
+        # 열4 — 시장 정보 (3개)
+        (0.765,"dot",  "#92400e", "",  "평균 참여업체수",     f"{a2['avg_companies']}개사" if a2 and a2.get('avg_companies') else "-"),
+        (0.765,"dot",  "#92400e", "",  "사정율 Drift",       f"{a3['drift']:+.4f}%  (최근 vs 이전)" if a3 else "-"),
+        (0.765,"dot",  "#92400e", "",  "최근 3건 평균",       f"{a3['recent3_mean']:+.4f}%" if a3 else "-"),
+    ]
+
+    # 열별 아이템 카운터
+    row_cnt = {0.01:0, 0.265:0, 0.515:0, 0.765:0}
+
+    # 행 간격 설정 — 세로를 넉넉하게
+    TOP_Y   = 0.73   # 첫 번째 아이템 y 시작
+    ROW_GAP = 0.225  # 행 간격 (클수록 여유 있음)
+
+    for (cx, itype, color, mk, label, desc) in items:
+        ri = row_cnt[cx]; row_cnt[cx] += 1
+        y  = TOP_Y - ri * ROW_GAP
+
+        # ── 아이콘 ──────────────────────────────────────────
+        if itype == "line":
+            ax_l.plot([cx+0.005, cx+0.040], [y+0.055, y+0.055],
+                      color=color, lw=2.5,
+                      transform=ax_l.transAxes, clip_on=False)
+        elif itype == "band":
+            ax_l.add_patch(mpatches.FancyBboxPatch(
+                (cx+0.005, y+0.025), 0.035, 0.07,
+                boxstyle="round,pad=0.003",
+                facecolor=color, alpha=0.28,
+                edgecolor=color, linewidth=1.2,
+                transform=ax_l.transAxes))
+        elif itype == "mark":
+            ax_l.plot([cx+0.022], [y+0.055],
+                      marker=mk, color=color, ms=10,
+                      transform=ax_l.transAxes, clip_on=False,
+                      markeredgecolor="white", markeredgewidth=1.4)
+        elif itype == "dot":
+            ax_l.plot([cx+0.022], [y+0.055],
+                      marker="o", color=color, ms=6,
+                      transform=ax_l.transAxes, clip_on=False, alpha=0.75)
+
+        # ── 레이블 (굵게) ────────────────────────────────────
+        ax_l.text(cx+0.050, y+0.110,
+                  label,
+                  fontsize=9, fontweight="bold", color="#1e293b",
+                  va="top", transform=ax_l.transAxes)
+
+        # ── 설명 (연하게) ────────────────────────────────────
+        ax_l.text(cx+0.050, y+0.010,
+                  desc,
+                  fontsize=8.5, color="#475569",
+                  va="top", transform=ax_l.transAxes)
+
+    # 하단 여백 안내선
+    ax_l.plot([0.01, 0.99], [0.045, 0.045],
+              color="#e2e8f0", lw=0.8, transform=ax_l.transAxes)
+
+    plt.subplots_adjust(left=0.055, right=0.93, top=0.95, bottom=0.02)
 
     buf = io.BytesIO()
-    plt.savefig(buf, format="png", dpi=130,
+    plt.savefig(buf, format="png", dpi=140,
                 bbox_inches="tight", facecolor="#f8fafc")
-    buf.seek(0)
-    plt.close()
+    buf.seek(0); plt.close()
     return buf
 
 # ── 엑셀 생성 ─────────────────────────────────────────────────
@@ -384,7 +466,7 @@ def make_excel(results):
 st.markdown("""
 <div class="main-header">
 <h2>📊 투찰전략 분석 시스템</h2>
-<p style="margin:0;opacity:0.8">3가지 분석 기반 투찰전략 자동 산출 | v1.6</p>
+<p style="margin:0;opacity:0.8">3가지 분석 기반 투찰전략 자동 산출 | v1.7</p>
 </div>""", unsafe_allow_html=True)
 
 with st.sidebar:
@@ -393,7 +475,7 @@ with st.sidebar:
     st.divider()
     df_hist = load_history()
     if df_hist is not None:
-        df_c_s = df_hist[df_hist["예가/기초(0%)"].notna() & (df_hist["예가/기초(0%)"].abs()<10)]
+        df_c_s = df_hist[df_hist["예가/기초(0%)"].notna()&(df_hist["예가/기초(0%)"].abs()<10)]
         st.success(f"✅ 낙찰이력 로드\n{len(df_c_s):,}건 | {df_c_s['발주기관'].nunique()}개 발주처")
     else:
         st.warning("⚠️ 낙찰이력 없음")
@@ -414,18 +496,18 @@ if mode == "🔧 배포자 관리":
         with st.spinner("처리 중..."):
             try:
                 content = uploaded.read()
-                df_new = pd.read_excel(io.BytesIO(content))
+                df_new  = pd.read_excel(io.BytesIO(content))
                 required = ["발주기관","공고명","기초금액","예가/기초(0%)"]
-                missing = [c for c in required if c not in df_new.columns]
+                missing  = [c for c in required if c not in df_new.columns]
                 if missing:
                     st.error(f"필수 컬럼 없음: {missing}")
                 else:
                     save_history(df_new)
                     df_v = df_new[df_new["예가/기초(0%)"].notna()&(df_new["예가/기초(0%)"].abs()<10)]
                     st.success("✅ 업로드 완료!")
-                    c1,c2,c3=st.columns(3)
-                    c1.metric("총 건수",f"{len(df_v):,}건")
-                    c2.metric("발주처 수",f"{df_v['발주기관'].nunique()}개")
+                    c1,c2,c3 = st.columns(3)
+                    c1.metric("총 건수",    f"{len(df_v):,}건")
+                    c2.metric("발주처 수",  f"{df_v['발주기관'].nunique()}개")
                     c3.metric("평균 사정율",f"{df_v['예가/기초(0%)'].mean():+.4f}%")
                     st.dataframe(df_v["발주기관"].value_counts().head(10).reset_index(),
                                  use_container_width=True, hide_index=True)
@@ -466,13 +548,11 @@ else:
                 st.error("입찰 건을 읽을 수 없습니다.")
                 st.stop()
         except Exception as e:
-            st.error(f"파일 오류: {e}")
-            st.stop()
+            st.error(f"파일 오류: {e}"); st.stop()
 
     st.success(f"✅ {len(bids)}건 확인")
-
     results = []
-    prog = st.progress(0,"분석 중...")
+    prog = st.progress(0, "분석 중...")
     for i,b in enumerate(bids):
         a1=analyze_pattern(b["org"],df_c)
         a2=analyze_similar(b["name"],b["base"],df_c)
@@ -505,52 +585,44 @@ else:
                                 "공고명":st.column_config.TextColumn(width=250)})
     st.divider()
 
-    # ── 건별 상세 + 흐름 차트 ────────────────────────────────
+    # ── 건별 상세 + 차트 ─────────────────────────────────────
     st.subheader("📌 건별 상세 + 사정율 흐름 차트")
-
     for row in results:
         b=row["bid"]; a1=row["a1"]; a2=row["a2"]; a3=row["a3"]
         lo,hi=row["range_lo"],row["range_hi"]
-        label = (f"No.{b['no']}  {b['name'][:50]}  |  "
-                 f"{b['org'].replace('한국전력공사 ','한전 ')}  |  "
-                 f"{b['base_억']:.4f}억  |  {b['deadline']}")
-
+        label=(f"No.{b['no']}  {b['name'][:50]}  |  "
+               f"{b['org'].replace('한국전력공사 ','한전 ')}  |  "
+               f"{b['base_억']:.4f}억  |  {b['deadline']}")
         with st.expander(label):
-            # ── 4가지 분석 카드 ──────────────────────────────
-            c1,c2,c3,c4 = st.columns(4)
+            c1,c2,c3,c4=st.columns(4)
             with c1:
                 v=f"{a1['pred']:+.4f}%" if a1 else "이력없음"
-                st.markdown(f'<div class="val-box val-pattern">①패턴<br>{v}</div>',
-                            unsafe_allow_html=True)
+                st.markdown(f'<div class="val-box val-pattern">①패턴<br>{v}</div>',unsafe_allow_html=True)
                 if a1:
                     st.caption(f"n={a1['n']}건 | {a1['trend']} | {a1['pattern']}패턴")
                     st.caption(f"r5={a1['r5']:+.4f} / r10={a1['r10']:+.4f} / 직전:{a1['last_val']:+.4f}%")
             with c2:
                 v=f"{a2['pred']:+.4f}%" if a2 else "이력없음"
-                st.markdown(f'<div class="val-box val-similar">②유사표본<br>{v}</div>',
-                            unsafe_allow_html=True)
+                st.markdown(f'<div class="val-box val-similar">②유사표본<br>{v}</div>',unsafe_allow_html=True)
                 if a2:
                     st.caption(f"유사 {a2['n']}건 | 평균:{a2['mean']:+.4f}%")
                     if a2["avg_companies"]: st.caption(f"업체수 평균:{a2['avg_companies']}개")
             with c3:
                 v=f"{a3['pred']:+.4f}%" if a3 else "이력없음"
-                st.markdown(f'<div class="val-box val-trend">③트렌드<br>{v}</div>',
-                            unsafe_allow_html=True)
+                st.markdown(f'<div class="val-box val-trend">③트렌드<br>{v}</div>',unsafe_allow_html=True)
                 if a3:
                     st.caption(f"최근{a3['recent_n']}건평균:{a3['recent_mean']:+.4f}%")
                     st.caption(f"drift:{a3['drift']:+.4f}% | 최근3건:{a3['recent3_mean']:+.4f}%")
             with c4:
                 if lo is not None:
-                    st.markdown(f'<div class="val-box val-rec">💡권장구간<br>{lo:+.4f}%~{hi:+.4f}%</div>',
-                                unsafe_allow_html=True)
+                    st.markdown(f'<div class="val-box val-rec">💡권장구간<br>{lo:+.4f}%~{hi:+.4f}%</div>',unsafe_allow_html=True)
                     if b["base"]>0:
                         st.caption(f"하한: {int(b['base']*(100+lo)/100):,}원")
                         st.caption(f"상한: {int(b['base']*(100+hi)/100):,}원")
                 else:
-                    st.markdown('<div class="val-box" style="background:#fee2e2;color:#991b1b">⚠️ 데이터부족</div>',
-                                unsafe_allow_html=True)
+                    st.markdown('<div class="val-box" style="background:#fee2e2;color:#991b1b">⚠️ 데이터부족</div>',unsafe_allow_html=True)
 
-            # ── 흐름 차트 ────────────────────────────────────
+            # 흐름 차트
             if a1 and a1.get("all_vals"):
                 st.markdown("---")
                 with st.spinner("차트 생성 중..."):
@@ -574,5 +646,5 @@ else:
         data=excel_buf,
         file_name=f"투찰전략_{today_str}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        type="primary", use_container_width=True
-    )
+        type="primary", use_container_width=True)
+
