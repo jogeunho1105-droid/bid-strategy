@@ -1,42 +1,21 @@
 # ╔══════════════════════════════════════════════════════════════╗
-# ║    투찰전략 분석 시스템 v1.8                                ║
-# ║    - 한글 폰트 자동감지                                     ║
-# ║    - 차트 세로 60% 축소                                     ║
-# ║    - 범례 패널 한글 + 깔끔한 간격                          ║
+# ║    투찰전략 분석 시스템 v1.9 — 영문 차트 (폰트 깨짐 해결)  ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import xlrd
-import io, os, json
+import io, os
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-import matplotlib.font_manager as fm
 from datetime import datetime
 
-# ── 한글 폰트 자동 감지 ────────────────────────────────────────
-def _setup_font():
-    candidates = [
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/noto/NotoSansCJKkr-Regular.otf",
-    ]
-    for fp in candidates:
-        if os.path.exists(fp):
-            fm.fontManager.addfont(fp)
-            break
-    cjk = [f.name for f in fm.fontManager.ttflist
-           if "Noto" in f.name and "CJK" in f.name]
-    name = cjk[0] if cjk else "DejaVu Sans"
-    plt.rcParams.update({"font.family": name, "axes.unicode_minus": False})
-    return name
+plt.rcParams.update({"font.family": "DejaVu Sans", "axes.unicode_minus": False})
 
-FONT_NAME = _setup_font()
-
-st.set_page_config(page_title="투찰전략 분석 시스템", page_icon="📊", layout="wide")
+st.set_page_config(page_title="Bid Strategy System", page_icon="📊", layout="wide")
 st.markdown("""
 <style>
 .main-header{background:linear-gradient(135deg,#1a2744,#243260);color:white;
@@ -50,9 +29,23 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-DATA_DIR = "data"
+DATA_DIR    = "data"
 HISTORY_FILE = os.path.join(DATA_DIR, "history.pkl")
 os.makedirs(DATA_DIR, exist_ok=True)
+
+# ── 한글 → 영문 변환 ───────────────────────────────────────────
+def tr_trend(t):
+    return {"↑상승":"Up","↓하락":"Down","→횡보":"Flat"}.get(t, t)
+
+def tr_pattern(p):
+    return {"연속성":"Momentum","반전":"Reversal","무작위":"Random"}.get(p, p)
+
+def tr_org(org):
+    return (org.replace("한국전력공사 ","KEPCO ")
+               .replace("본부","").replace("지사","")
+               .replace("한국철도공사 회계통합센터","KORAIL")
+               .replace("조달청","PPS")
+               .replace("국군재정관리단","MND"))
 
 # ── 낙찰이력 ──────────────────────────────────────────────────
 @st.cache_data
@@ -66,7 +59,7 @@ def save_history(df):
     df.to_pickle(HISTORY_FILE)
     st.cache_data.clear()
 
-# ── 분석 ──────────────────────────────────────────────────────
+# ── 분석 함수 ──────────────────────────────────────────────────
 def analyze_pattern(org, df_c):
     sub = df_c[df_c["발주기관"]==org]["예가/기초(0%)"].values
     if len(sub)<5: return None
@@ -140,25 +133,23 @@ def parse_xls(file_bytes):
                      "region":row.get("지역","")})
     return bids
 
-# ── 흐름 차트 (세로 60% 축소 + 한글 폰트) ────────────────────
-def make_flow_chart(a1, a2, a3, lo, hi, org_name):
+# ── 흐름 차트 (완전 영문) ─────────────────────────────────────
+def make_flow_chart(a1, a2, a3, lo, hi, org_raw):
     all_v = a1.get("all_vals", [])
     if not all_v: return None
 
+    org_en  = tr_org(org_raw)
     show_n  = min(30, len(all_v))
     recent  = all_v[-show_n:]
     x       = np.arange(1, show_n+1)
     next_x  = show_n + 1
     mean_v  = a1["mean"]
 
-    # figsize: (13, 5.5) — 기존 8.5 대비 약 65%
     fig = plt.figure(figsize=(13, 5.5), facecolor="#f8fafc")
     gs  = fig.add_gridspec(2, 1, height_ratios=[2.6, 1.0], hspace=0.04)
     ax   = fig.add_subplot(gs[0])
     ax_l = fig.add_subplot(gs[1])
-    ax.set_facecolor("#ffffff")
-    ax_l.set_facecolor("#f8fafc")
-    ax_l.axis("off")
+    ax.set_facecolor("#ffffff"); ax_l.set_facecolor("#f8fafc"); ax_l.axis("off")
 
     # 0선
     ax.axhline(0, color="#94a3b8", lw=1.0, alpha=0.8, zorder=1)
@@ -188,9 +179,9 @@ def make_flow_chart(a1, a2, a3, lo, hi, org_name):
     ax.axvline(show_n+0.5, color="#7c3aed", lw=1.4, ls=":", alpha=0.75)
     # 예측 포인트
     preds = []
-    if a1: preds.append(("①패턴",    a1["pred"], "#1d4ed8", "D", 10))
-    if a2: preds.append(("②유사표본", a2["pred"], "#15803d", "s", 10))
-    if a3: preds.append(("③트렌드",  a3["pred"], "#92400e", "^", 10))
+    if a1: preds.append(("(1)Pattern",  a1["pred"], "#1d4ed8", "D", 10))
+    if a2: preds.append(("(2)Similar",  a2["pred"], "#15803d", "s", 10))
+    if a3: preds.append(("(3)Trend",    a3["pred"], "#92400e", "^", 10))
     xoff = [-0.32, 0.0, 0.32]
     for idx, (lbl, pv, pc, mk, ms) in enumerate(preds):
         px = next_x + xoff[idx]
@@ -205,32 +196,33 @@ def make_flow_chart(a1, a2, a3, lo, hi, org_name):
         bx = next_x + 1.3
         ax.annotate("", xy=(bx, lo), xytext=(bx, hi),
                     arrowprops=dict(arrowstyle="<->", color="#7c3aed", lw=2.0))
-        ax.text(bx+0.15, (lo+hi)/2, f"권장\n{lo:+.4f}\n~{hi:+.4f}",
+        ax.text(bx+0.15, (lo+hi)/2, f"Rec.\n{lo:+.4f}\n~{hi:+.4f}",
                 fontsize=7.5, color="#7c3aed", fontweight="bold",
                 va="center", ha="left",
                 bbox=dict(boxstyle="round,pad=0.3", fc="#f3e8ff",
                           ec="#7c3aed", alpha=0.9))
     # 우측 보조축
     ax_r = ax.twinx(); ax_r.set_ylim(ax.get_ylim())
-    ticks = [mean_v]; tlbls = [f"평균:{mean_v:+.3f}"]
+    ticks=[mean_v]; tlbls=[f"Avg:{mean_v:+.3f}"]
     if lo is not None:
-        ticks += [lo, hi]; tlbls += [f"하한:{lo:+.3f}", f"상한:{hi:+.3f}"]
+        ticks+=[lo,hi]; tlbls+=[f"Lo:{lo:+.3f}",f"Hi:{hi:+.3f}"]
     ax_r.set_yticks(ticks)
     ax_r.set_yticklabels(tlbls, fontsize=7, color="#64748b")
     # 축
     ax.set_xlim(0.3, next_x+2.8)
     ax.set_xticks(list(x)+[next_x])
-    ax.set_xticklabels([f"-{show_n-i}" for i in range(show_n)]+["예측"],
-                       fontsize=7)
-    ax.set_ylabel("예가/기초(0%) %", fontsize=8)
+    ax.set_xticklabels([f"-{show_n-i}" for i in range(show_n)]+["Pred"], fontsize=7)
+    ax.set_ylabel("Pred/Base(0%) %", fontsize=8)
     ax.tick_params(labelsize=7.5)
     ax.grid(axis="y", alpha=0.18, ls="--")
     ax.set_title(
-        f"{org_name}  —  최근 {show_n}건  |  트렌드: {a1['trend']}  |  "
-        f"패턴: {a1['pattern']}  |  자기상관: {a1['autocorr']:+.3f}  |  전체 n={a1['n']}",
+        f"{org_en}  |  Last {show_n} results  |  "
+        f"Trend: {tr_trend(a1['trend'])}  |  "
+        f"Pattern: {tr_pattern(a1['pattern'])}  |  "
+        f"AutoCorr: {a1['autocorr']:+.3f}  |  n={a1['n']}",
         fontsize=9.5, fontweight="bold", color="#1a2744", pad=8)
 
-    # ── 범례 패널 ────────────────────────────────────────────
+    # ── 범례 패널 (완전 영문) ────────────────────────────────
     ax_l.set_xlim(0,1); ax_l.set_ylim(0,1)
     ax_l.add_patch(mpatches.FancyBboxPatch(
         (0.005,0.03), 0.990, 0.94,
@@ -239,49 +231,51 @@ def make_flow_chart(a1, a2, a3, lo, hi, org_name):
         transform=ax_l.transAxes))
 
     col_defs = [
-        (0.01,  "차트 범례", "#1d4ed8"),
-        (0.265, "예측값",    "#15803d"),
-        (0.515, "패턴 상세", "#7c3aed"),
-        (0.765, "시장 정보", "#92400e"),
+        (0.01,  "Chart Legend",   "#1d4ed8"),
+        (0.265, "Prediction",     "#15803d"),
+        (0.515, "Pattern Detail", "#7c3aed"),
+        (0.765, "Market Info",    "#92400e"),
     ]
     for cx, htxt, hcol in col_defs:
         ax_l.add_patch(mpatches.FancyBboxPatch(
-            (cx+0.002, 0.80), 0.238, 0.16,
+            (cx+0.002,0.80), 0.238, 0.16,
             boxstyle="round,pad=0.005",
             facecolor=hcol, alpha=0.12, edgecolor="none",
             transform=ax_l.transAxes))
         ax_l.text(cx+0.012, 0.885, htxt, fontsize=9, fontweight="bold",
                   color=hcol, va="center", transform=ax_l.transAxes)
     for lx in [0.255, 0.505, 0.755]:
-        ax_l.plot([lx,lx], [0.04,0.97],
+        ax_l.plot([lx,lx],[0.04,0.97],
                   color="#e2e8f0", lw=1.0, transform=ax_l.transAxes)
 
+    a2n  = a2["n"]  if a2 else "-"
+    a2co = f"{a2['avg_companies']} firms" if a2 and a2.get('avg_companies') else "-"
     items = [
-        (0.01,  "line", "#1a2744","",  "실제 낙찰 사정율",
-                f"최근 {show_n}건 실제 낙찰 결과값"),
-        (0.01,  "line", "#6366f1","",  "이동평균 MA(5)",
-                "최근 5건 이동평균 추세선"),
-        (0.01,  "line", "#f59e0b","",  "전체 평균선",
-                f"전체 평균: {mean_v:+.4f}%"),
-        (0.01,  "band", "#7c3aed","",  "권장 투찰 구간",
+        (0.01,  "line","#1a2744","","Actual bid result",
+                f"Last {show_n} results"),
+        (0.01,  "line","#6366f1","","Moving Avg MA(5)",
+                "5-case moving average"),
+        (0.01,  "line","#f59e0b","","Overall Average",
+                f"Avg: {mean_v:+.4f}%"),
+        (0.01,  "band","#7c3aed","","Recommended Zone",
                 f"{lo:+.4f}%  ~  {hi:+.4f}%" if lo is not None else "-"),
-        (0.265, "mark", "#1d4ed8","D", "①패턴 분석",
-                f"발주처 이력 패턴  →  {a1['pred']:+.4f}%"),
-        (0.265, "mark", "#15803d","s", "②유사표본 분석",
-                f"유사용역 {a2['n']}건 표본  →  {a2['pred']:+.4f}%" if a2 else "이력 없음"),
-        (0.265, "mark", "#92400e","^", "③트렌드 분석",
-                f"최근 흐름 기반  →  {a3['pred']:+.4f}%" if a3 else "이력 없음"),
-        (0.515, "dot",  "#7c3aed","",  "최근 5건 평균 (r5)",
+        (0.265, "mark","#1d4ed8","D","(1) Pattern",
+                f"Issuer history  ->  {a1['pred']:+.4f}%"),
+        (0.265, "mark","#15803d","s","(2) Similar Cases",
+                f"n={a2n} samples  ->  {a2['pred']:+.4f}%" if a2 else "No data"),
+        (0.265, "mark","#92400e","^","(3) Trend",
+                f"Recent drift  ->  {a3['pred']:+.4f}%" if a3 else "No data"),
+        (0.515, "dot", "#7c3aed","","Last 5 avg (r5)",
                 f"{a1['r5']:+.4f}%"),
-        (0.515, "dot",  "#7c3aed","",  "최근 10건 평균 (r10)",
+        (0.515, "dot", "#7c3aed","","Last 10 avg (r10)",
                 f"{a1['r10']:+.4f}%"),
-        (0.515, "dot",  "#7c3aed","",  "직전 낙찰 사정율",
+        (0.515, "dot", "#7c3aed","","Previous result",
                 f"{a1['last_val']:+.4f}%"),
-        (0.765, "dot",  "#92400e","",  "평균 참여업체수",
-                f"{a2['avg_companies']}개사" if a2 and a2.get('avg_companies') else "-"),
-        (0.765, "dot",  "#92400e","",  "사정율 Drift",
-                f"{a3['drift']:+.4f}%  (최근 vs 이전)" if a3 else "-"),
-        (0.765, "dot",  "#92400e","",  "최근 3건 평균",
+        (0.765, "dot", "#92400e","","Avg firms",
+                a2co),
+        (0.765, "dot", "#92400e","","Srate Drift",
+                f"{a3['drift']:+.4f}%  (recent vs old)" if a3 else "-"),
+        (0.765, "dot", "#92400e","","Last 3 avg",
                 f"{a3['recent3_mean']:+.4f}%" if a3 else "-"),
     ]
     row_cnt = {0.01:0, 0.265:0, 0.515:0, 0.765:0}
@@ -295,8 +289,7 @@ def make_flow_chart(a1, a2, a3, lo, hi, org_name):
                       color=color,lw=2.4,transform=ax_l.transAxes,clip_on=False)
         elif itype=="band":
             ax_l.add_patch(mpatches.FancyBboxPatch(
-                (cx+0.005,y+0.02),0.033,0.065,
-                boxstyle="round,pad=0.003",
+                (cx+0.005,y+0.02),0.033,0.065,boxstyle="round,pad=0.003",
                 facecolor=color,alpha=0.28,edgecolor=color,linewidth=1.1,
                 transform=ax_l.transAxes))
         elif itype=="mark":
@@ -306,23 +299,23 @@ def make_flow_chart(a1, a2, a3, lo, hi, org_name):
         elif itype=="dot":
             ax_l.plot([cx+0.022],[y+0.05],marker="o",color=color,ms=5.5,
                       transform=ax_l.transAxes,clip_on=False,alpha=0.75)
-        ax_l.text(cx+0.048, y+0.100, label,
-                  fontsize=8.5, fontweight="bold", color="#1e293b",
-                  va="top", transform=ax_l.transAxes)
-        ax_l.text(cx+0.048, y+0.005, desc,
-                  fontsize=8, color="#475569",
-                  va="top", transform=ax_l.transAxes)
+        ax_l.text(cx+0.048,y+0.100,label,
+                  fontsize=8.5,fontweight="bold",color="#1e293b",
+                  va="top",transform=ax_l.transAxes)
+        ax_l.text(cx+0.048,y+0.005,desc,
+                  fontsize=8,color="#475569",
+                  va="top",transform=ax_l.transAxes)
 
     ax_l.plot([0.01,0.99],[0.045,0.045],
               color="#e2e8f0",lw=0.8,transform=ax_l.transAxes)
     plt.subplots_adjust(left=0.055,right=0.92,top=0.95,bottom=0.02)
 
     buf = io.BytesIO()
-    plt.savefig(buf, format="png", dpi=140, bbox_inches="tight", facecolor="#f8fafc")
+    plt.savefig(buf,format="png",dpi=140,bbox_inches="tight",facecolor="#f8fafc")
     buf.seek(0); plt.close()
     return buf
 
-# ── 엑셀 ──────────────────────────────────────────────────────
+# ── 엑셀 생성 ─────────────────────────────────────────────────
 def make_excel(results):
     from openpyxl import Workbook
     from openpyxl.styles import Font,PatternFill,Alignment,Border,Side
@@ -430,14 +423,14 @@ def make_excel(results):
 st.markdown("""
 <div class="main-header">
 <h2>📊 투찰전략 분석 시스템</h2>
-<p style="margin:0;opacity:0.8">3가지 분석 기반 투찰전략 자동 산출 | v1.8</p>
+<p style="margin:0;opacity:0.8">3가지 분석 기반 투찰전략 자동 산출 | v1.9</p>
 </div>""", unsafe_allow_html=True)
 
 with st.sidebar:
     st.header("⚙️ 시스템 설정")
-    mode = st.radio("모드 선택", ["📊 투찰전략 분석","🔧 배포자 관리"])
+    mode=st.radio("모드 선택",["📊 투찰전략 분석","🔧 배포자 관리"])
     st.divider()
-    df_hist = load_history()
+    df_hist=load_history()
     if df_hist is not None:
         df_c_s=df_hist[df_hist["예가/기초(0%)"].notna()&(df_hist["예가/기초(0%)"].abs()<10)]
         st.success(f"✅ 낙찰이력 로드\n{len(df_c_s):,}건 | {df_c_s['발주기관'].nunique()}개 발주처")
@@ -446,13 +439,11 @@ with st.sidebar:
     st.divider()
     st.caption(f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
-# ══ 배포자 관리 ══════════════════════════════════════════════════
 if mode=="🔧 배포자 관리":
     st.header("🔧 배포자 관리")
     pwd=st.text_input("관리자 비밀번호",type="password")
     ADMIN_PWD=st.secrets.get("ADMIN_PWD","admin1234")
-    if pwd!=ADMIN_PWD:
-        st.info("비밀번호를 입력하세요."); st.stop()
+    if pwd!=ADMIN_PWD: st.info("비밀번호를 입력하세요."); st.stop()
     st.success("✅ 관리자 인증")
     uploaded=st.file_uploader("낙찰이력 xlsx 업로드",type=["xlsx","xls"])
     if uploaded:
@@ -462,8 +453,7 @@ if mode=="🔧 배포자 관리":
                 df_new=pd.read_excel(io.BytesIO(content))
                 required=["발주기관","공고명","기초금액","예가/기초(0%)"]
                 missing=[c for c in required if c not in df_new.columns]
-                if missing:
-                    st.error(f"필수 컬럼 없음: {missing}")
+                if missing: st.error(f"필수 컬럼 없음: {missing}")
                 else:
                     save_history(df_new)
                     df_v=df_new[df_new["예가/기초(0%)"].notna()&(df_new["예가/기초(0%)"].abs()<10)]
@@ -474,14 +464,10 @@ if mode=="🔧 배포자 관리":
                     c3.metric("평균 사정율",f"{df_v['예가/기초(0%)'].mean():+.4f}%")
                     st.dataframe(df_v["발주기관"].value_counts().head(10).reset_index(),
                                  use_container_width=True,hide_index=True)
-            except Exception as e:
-                st.error(f"오류: {e}")
-
-# ══ 투찰전략 분석 ════════════════════════════════════════════════
+            except Exception as e: st.error(f"오류: {e}")
 else:
     df_hist=load_history()
-    if df_hist is None:
-        st.error("낙찰이력 없음. 배포자에게 문의하세요."); st.stop()
+    if df_hist is None: st.error("낙찰이력 없음."); st.stop()
     df_c=df_hist[df_hist["예가/기초(0%)"].notna()&(df_hist["예가/기초(0%)"].abs()<10)].copy()
 
     st.header("📊 투찰전략 분석")
@@ -506,8 +492,7 @@ else:
         try:
             bids=parse_xls(xls_file.read())
             if not bids: st.error("입찰 건을 읽을 수 없습니다."); st.stop()
-        except Exception as e:
-            st.error(f"파일 오류: {e}"); st.stop()
+        except Exception as e: st.error(f"파일 오류: {e}"); st.stop()
 
     st.success(f"✅ {len(bids)}건 확인")
     results=[]
@@ -582,9 +567,7 @@ else:
             if a1 and a1.get("all_vals"):
                 st.markdown("---")
                 with st.spinner("차트 생성 중..."):
-                    chart_buf=make_flow_chart(
-                        a1,a2,a3,lo,hi,
-                        b["org"].replace("한국전력공사 ","한전 "))
+                    chart_buf=make_flow_chart(a1,a2,a3,lo,hi,b["org"])
                 if chart_buf:
                     st.image(chart_buf,use_container_width=True)
             else:
@@ -599,4 +582,3 @@ else:
         file_name=f"투찰전략_{today_str}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",use_container_width=True)
-
