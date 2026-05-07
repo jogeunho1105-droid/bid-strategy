@@ -235,7 +235,7 @@ def tr_org(org):
 
 # ── 한전 세분화 분석 함수들 ────────────────────────────────────
 
-DIAG_KWS = ['광학', '초음파', 'VLF', 'PD']  # 진단 분야 키워드
+DIAG_KWS = ['광학', '초음파', 'VLF', 'PD', '콘크리트']  # 진단 분야 키워드
 
 def is_kepco(org):
     """한전 소속 여부"""
@@ -912,7 +912,7 @@ else:
                 # ① 진단 분야 (광학/초음파/VLF/PD)
                 if is_diag(b["name"]):
                     st.markdown("---")
-                    st.markdown("**📡 ENG 진단 분야 세분화 분석** (광학·초음파·VLF·PD)")
+                    st.markdown("**📡 ENG 진단 분야 세분화 분석** (광학·초음파·VLF·PD·콘크리트)")
                     diag_all = analyze_diag_all(df_c)
                     diag_org = analyze_diag_org(b["org"], df_c)
                     if diag_all or diag_org:
