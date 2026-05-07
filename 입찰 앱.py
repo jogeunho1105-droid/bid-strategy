@@ -232,6 +232,189 @@ def tr_org(org):
                .replace("조달청","PPS").replace("국군재정관리단","MND"))
 
 # ── 흐름 차트 ─────────────────────────────────────────────────
+
+# ── 한전 세분화 분석 함수들 ────────────────────────────────────
+
+DIAG_KWS = ['광학', '초음파', 'VLF', 'PD']  # 진단 분야 키워드
+
+def is_kepco(org):
+    """한전 소속 여부"""
+    return '한국전력공사' in str(org)
+
+def is_diag(name):
+    """진단 분야 여부 (광학/초음파/VLF/PD)"""
+    return any(kw in str(name) for kw in DIAG_KWS)
+
+def is_supervision(name):
+    """감리 분야 여부"""
+    return '감리' in str(name)
+
+def analyze_diag_all(df_c):
+    """진단 분야 전체 한전 통계 (전체 지역 차트용)"""
+    if df_c is None: return None
+    kepco = df_c[df_c['발주기관'].str.contains('한국전력공사', na=False)]
+    diag  = kepco[kepco['공고명'].str.contains('|'.join(DIAG_KWS), na=False)]
+    vals  = diag['예가/기초(0%)'].values
+    if len(vals) < 5: return None
+    n = len(vals)
+    mean_v = float(np.mean(vals)); std_v = float(np.std(vals))
+    r5  = float(np.mean(vals[-5:]))
+    r10 = float(np.mean(vals[-10:])) if n>=10 else mean_v
+    ac  = float(np.corrcoef(vals[:-1], vals[1:])[0,1]) if n>=3 else 0
+    coef = float(np.polyfit(np.arange(min(20,n)), vals[-min(20,n):], 1)[0])
+    trend = '↑상승' if coef>0.02 else '↓하락' if coef<-0.02 else '→횡보'
+    pred = 0.25*r5 + 0.20*r10 + 0.55*mean_v
+    # 발주처별 분포
+    org_dist = diag.groupby('발주기관')['예가/기초(0%)'].agg(['mean','count']).round(4)
+    return {
+        'pred': round(pred,4), 'mean': round(mean_v,4), 'std': round(std_v,4),
+        'r5': round(r5,4), 'r10': round(r10,4), 'n': n,
+        'trend': trend, 'autocorr': round(ac,4),
+        'all_vals': vals.tolist(), 'recent10': [round(float(v),4) for v in vals[-10:]],
+        'conservative': round(pred-std_v*0.4,4), 'aggressive': round(pred+std_v*0.4,4),
+        'org_dist': org_dist.to_dict() if len(org_dist)>0 else {},
+        'scope': '전체 한전 (진단)',
+    }
+
+def analyze_diag_org(org, df_c):
+    """특정 한전 발주처의 진단 분야 통계"""
+    if df_c is None: return None
+    sub = df_c[(df_c['발주기관']==org) &
+               df_c['공고명'].str.contains('|'.join(DIAG_KWS), na=False)]
+    vals = sub['예가/기초(0%)'].values
+    if len(vals) < 3: return None
+    n = len(vals)
+    mean_v = float(np.mean(vals)); std_v = float(np.std(vals))
+    r5  = float(np.mean(vals[-5:])) if n>=5 else mean_v
+    r10 = float(np.mean(vals[-10:])) if n>=10 else mean_v
+    pred = 0.25*r5 + 0.20*r10 + 0.55*mean_v
+    org_short = org.replace('한국전력공사 ','').replace('본부','')
+    return {
+        'pred': round(pred,4), 'mean': round(mean_v,4), 'std': round(std_v,4),
+        'r5': round(r5,4), 'r10': round(r10,4), 'n': n,
+        'all_vals': vals.tolist(), 'recent10': [round(float(v),4) for v in vals[-10:]],
+        'conservative': round(pred-std_v*0.4,4), 'aggressive': round(pred+std_v*0.4,4),
+        'scope': f'{org_short} (진단)',
+    }
+
+def analyze_supervision_all(df_c):
+    """전체 한전 감리 통계 (전체 지역 차트용)"""
+    if df_c is None: return None
+    kepco = df_c[df_c['발주기관'].str.contains('한국전력공사', na=False)]
+    sup   = kepco[kepco['공고명'].str.contains('감리', na=False)]
+    vals  = sup['예가/기초(0%)'].values
+    if len(vals) < 5: return None
+    n = len(vals)
+    mean_v = float(np.mean(vals)); std_v = float(np.std(vals))
+    r5  = float(np.mean(vals[-5:]))
+    r10 = float(np.mean(vals[-10:])) if n>=10 else mean_v
+    ac  = float(np.corrcoef(vals[:-1], vals[1:])[0,1]) if n>=3 else 0
+    coef = float(np.polyfit(np.arange(min(20,n)), vals[-min(20,n):], 1)[0])
+    trend = '↑상승' if coef>0.02 else '↓하락' if coef<-0.02 else '→횡보'
+    pred = 0.25*r5 + 0.20*r10 + 0.55*mean_v
+    return {
+        'pred': round(pred,4), 'mean': round(mean_v,4), 'std': round(std_v,4),
+        'r5': round(r5,4), 'r10': round(r10,4), 'n': n,
+        'trend': trend, 'autocorr': round(ac,4),
+        'all_vals': vals.tolist(), 'recent10': [round(float(v),4) for v in vals[-10:]],
+        'conservative': round(pred-std_v*0.4,4), 'aggressive': round(pred+std_v*0.4,4),
+        'scope': '전체 한전 (감리)',
+    }
+
+def analyze_supervision_org(org, df_c):
+    """특정 한전 발주처 감리 통계"""
+    if df_c is None: return None
+    sub = df_c[(df_c['발주기관']==org) &
+               df_c['공고명'].str.contains('감리', na=False)]
+    vals = sub['예가/기초(0%)'].values
+    if len(vals) < 3: return None
+    n = len(vals)
+    mean_v = float(np.mean(vals)); std_v = float(np.std(vals))
+    r5  = float(np.mean(vals[-5:])) if n>=5 else mean_v
+    r10 = float(np.mean(vals[-10:])) if n>=10 else mean_v
+    pred = 0.25*r5 + 0.20*r10 + 0.55*mean_v
+    org_short = org.replace('한국전력공사 ','').replace('본부','')
+    return {
+        'pred': round(pred,4), 'mean': round(mean_v,4), 'std': round(std_v,4),
+        'r5': round(r5,4), 'r10': round(r10,4), 'n': n,
+        'all_vals': vals.tolist(), 'recent10': [round(float(v),4) for v in vals[-10:]],
+        'conservative': round(pred-std_v*0.4,4), 'aggressive': round(pred+std_v*0.4,4),
+        'scope': f'{org_short} (감리)',
+    }
+
+
+def make_sector_chart(data_all, data_org, lo, hi, title):
+    """전체지역 vs 해당발주처 비교 차트 (2개 서브플롯)"""
+    if not data_all and not data_org: return None
+    datasets = []
+    if data_all: datasets.append((data_all, data_all['scope'], '#1d4ed8'))
+    if data_org: datasets.append((data_org, data_org['scope'], '#dc2626'))
+    ncols = len(datasets)
+
+    fig, axes = plt.subplots(1, ncols, figsize=(13, 4.5),
+                             facecolor='#f8fafc', sharey=False)
+    if ncols == 1: axes = [axes]
+
+    for ax, (data, scope, color) in zip(axes, datasets):
+        ax.set_facecolor('#ffffff')
+        vals  = data.get('all_vals') or data.get('recent10', [])
+        show_n = min(30, len(vals))
+        recent = vals[-show_n:]
+        x = np.arange(1, show_n+1)
+        mean_v = data['mean']
+        pred_v = data['pred']
+
+        # 0선
+        ax.axhline(0, color='#94a3b8', lw=1.0, alpha=0.7, zorder=1)
+        # 권장구간 배경
+        if lo and hi:
+            ax.axhspan(lo, hi, alpha=0.10, color='#7c3aed', zorder=1)
+        # 평균선
+        ax.axhline(mean_v, color='#f59e0b', lw=1.3, ls='--', alpha=0.8, zorder=2,
+                   label=f'Avg:{mean_v:+.3f}%')
+        # MA5
+        ma5 = [np.mean(recent[max(0,i-4):i+1]) for i in range(show_n)]
+        ax.plot(x, ma5, color='#6366f1', lw=1.5, ls='--', alpha=0.7,
+                zorder=3, label='MA(5)')
+        # 막대
+        bar_c = [color if v>=0 else '#94a3b8' for v in recent]
+        ax.bar(x, recent, color=bar_c, alpha=0.38, width=0.65, zorder=2)
+        # 꺾은선
+        ax.plot(x, recent, color='#1a2744', lw=1.5, marker='o', ms=3.5, zorder=4)
+        # 최근 10건 라벨
+        for i in range(max(0, show_n-10), show_n):
+            v = recent[i]
+            ax.annotate(f'{v:+.3f}', xy=(x[i], v),
+                        xytext=(0, 7 if v>=0 else -11),
+                        textcoords='offset points', ha='center', fontsize=6,
+                        color='#059669' if v>=0 else '#dc2626', fontweight='bold')
+        # 예측값
+        ax.axvline(show_n+0.5, color='#7c3aed', lw=1.2, ls=':', alpha=0.7)
+        ax.plot([show_n+1], [pred_v], marker='D', color='#7c3aed', ms=9,
+                zorder=7, markeredgecolor='white', markeredgewidth=1.2)
+        ax.annotate(f'{pred_v:+.4f}%', xy=(show_n+1, pred_v),
+                    xytext=(16, 0), textcoords='offset points',
+                    ha='left', fontsize=8, color='#7c3aed', fontweight='bold',
+                    arrowprops=dict(arrowstyle='->', color='#7c3aed', lw=1))
+
+        ax.set_xlim(0.3, show_n+3.2)
+        ax.set_xticks(list(x)+[show_n+1])
+        ax.set_xticklabels([f'-{show_n-i}' for i in range(show_n)]+['Pred'],
+                           fontsize=7)
+        ax.set_ylabel('Pred/Base(0%) %', fontsize=8)
+        ax.tick_params(labelsize=7.5)
+        ax.grid(axis='y', alpha=0.18, ls='--')
+        ax.legend(fontsize=7.5, loc='upper left')
+        ax.set_title(f'{scope}  (n={data["n"]})', fontsize=9.5,
+                     fontweight='bold', color='#1a2744', pad=6)
+
+    fig.suptitle(title, fontsize=10, fontweight='bold', color='#1a2744', y=1.01)
+    plt.tight_layout(pad=0.8)
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=130, bbox_inches='tight', facecolor='#f8fafc')
+    buf.seek(0); plt.close()
+    return buf
+
 def make_flow_chart(a1, a2, a3, lo, hi, org_raw):
     all_v = (a1.get("all_vals") or []) if a1 else []
     if not all_v:
@@ -723,6 +906,70 @@ else:
                     st.image(chart_buf,use_container_width=True)
             else:
                 st.caption("⚠️ 이력 데이터 부족으로 차트를 표시할 수 없습니다.")
+
+            # ── 한전 세분화 분석 차트 ────────────────────────
+            if is_kepco(b["org"]) and df_c is not None:
+                # ① 진단 분야 (광학/초음파/VLF/PD)
+                if is_diag(b["name"]):
+                    st.markdown("---")
+                    st.markdown("**📡 ENG 진단 분야 세분화 분석** (광학·초음파·VLF·PD)")
+                    diag_all = analyze_diag_all(df_c)
+                    diag_org = analyze_diag_org(b["org"], df_c)
+                    if diag_all or diag_org:
+                        col_da, col_db = st.columns(2)
+                        with col_da:
+                            if diag_all:
+                                st.metric("전체 한전 진단 평균",
+                                          f"{diag_all['pred']:+.4f}%",
+                                          f"n={diag_all['n']}건")
+                                st.caption(f"보수:{diag_all['conservative']:+.4f}% / 공격:{diag_all['aggressive']:+.4f}%")
+                        with col_db:
+                            if diag_org:
+                                org_s = b['org'].replace('한국전력공사 ','').replace('본부','')
+                                st.metric(f"{org_s} 진단 평균",
+                                          f"{diag_org['pred']:+.4f}%",
+                                          f"n={diag_org['n']}건")
+                                st.caption(f"보수:{diag_org['conservative']:+.4f}% / 공격:{diag_org['aggressive']:+.4f}%")
+                        with st.spinner("진단 분야 비교 차트 생성 중..."):
+                            sec_buf = make_sector_chart(
+                                diag_all, diag_org, lo, hi,
+                                f"ENG Diagnosis — All KEPCO  vs  {b['org'].replace('한국전력공사 ','KEPCO ').replace('본부','')}"
+                            )
+                        if sec_buf:
+                            st.image(sec_buf, use_container_width=True)
+                    else:
+                        st.caption("진단 분야 이력 데이터 부족")
+
+                # ② 감리 분야
+                elif is_supervision(b["name"]):
+                    st.markdown("---")
+                    st.markdown("**🏗️ 감리 분야 세분화 분석**")
+                    sup_all = analyze_supervision_all(df_c)
+                    sup_org = analyze_supervision_org(b["org"], df_c)
+                    if sup_all or sup_org:
+                        col_sa, col_sb = st.columns(2)
+                        with col_sa:
+                            if sup_all:
+                                st.metric("전체 한전 감리 평균",
+                                          f"{sup_all['pred']:+.4f}%",
+                                          f"n={sup_all['n']}건")
+                                st.caption(f"보수:{sup_all['conservative']:+.4f}% / 공격:{sup_all['aggressive']:+.4f}%")
+                        with col_sb:
+                            if sup_org:
+                                org_s = b['org'].replace('한국전력공사 ','').replace('본부','')
+                                st.metric(f"{org_s} 감리 평균",
+                                          f"{sup_org['pred']:+.4f}%",
+                                          f"n={sup_org['n']}건")
+                                st.caption(f"보수:{sup_org['conservative']:+.4f}% / 공격:{sup_org['aggressive']:+.4f}%")
+                        with st.spinner("감리 분야 비교 차트 생성 중..."):
+                            sec_buf = make_sector_chart(
+                                sup_all, sup_org, lo, hi,
+                                f"Supervision — All KEPCO  vs  {b['org'].replace('한국전력공사 ','KEPCO ').replace('본부','')}"
+                            )
+                        if sec_buf:
+                            st.image(sec_buf, use_container_width=True)
+                    else:
+                        st.caption("감리 분야 이력 데이터 부족")
 
     st.divider()
     st.subheader("💾 전략표 다운로드")
