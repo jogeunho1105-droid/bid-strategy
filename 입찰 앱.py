@@ -1,9 +1,11 @@
 # ╔══════════════════════════════════════════════════════════════════╗
-# ║  투찰전략 분석 시스템 v2.1                                      ║
-# ║  신규: 3개 업체 분산투찰 3포인트 전략 (30,614건 기반)          ║
-# ║  - 업체A: 편향방향 주력 / 업체B: 차트예측 / 업체C: 역방향헷지  ║
-# ║  - 발주처별 최적 포인트 + 커버율 표시                           ║
-# ║  - 한전 세분화: 진단(광학·초음파·VLF·PD·콘크리트) / 감리       ║
+# ║  투찰전략 분석 시스템 v2.2                                      ║
+# ║  개선: 2026-05-13 낙찰이력 업데이트 반영                       ║
+# ║  - 비한전/조달청: 3포인트 미적용, 단일전략 표시                 ║
+# ║  - ③트렌드 최소값 보정 (±0.02% 미만 시 보정)                  ║
+# ║  - ②유사표본 없을 때 진단/감리 분야 전체평균으로 대체           ║
+# ║  - 진단 분야 세분화 예측값 → ②유사표본에 통합                  ║
+# ║  - 3포인트 A/C 포인트 업데이트 (최신 이력 반영)                ║
 # ╚══════════════════════════════════════════════════════════════════╝
 
 import streamlit as st
@@ -48,7 +50,7 @@ HISTORY_FILE = os.path.join(DATA_DIR, "history.pkl")
 PATTERN_FILE = os.path.join(DATA_DIR, "pattern_stats.json")
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# ── 3포인트 전략 DB (30,614건 기반) ───────────────────────────
+# ── 3포인트 전략 DB (최신 낙찰이력 기반, 2026-05-13 업데이트) ─
 THREE_PT = {
     "한국전력공사 경기본부":         {"bias":"음수↓","detail":"음60%/중13%/양27%","pt_a":-0.40,"pt_c":+0.20,"cover":63,"cover_r":73,"note":"음수편향 강함"},
     "한국전력공사 부산울산본부":     {"bias":"음수↓","detail":"음55%/중23%/양23%","pt_a":-0.25,"pt_c":+0.35,"cover":62,"cover_r":87,"note":"최근커버 87% 우수"},
@@ -64,7 +66,18 @@ THREE_PT = {
     "한국전력공사 충북본부":         {"bias":"균형", "detail":"음47%/중3%/양50%", "pt_a":-0.30,"pt_c":+0.30,"cover":62,"cover_r":0, "note":"균형형"},
     "한국전력공사 경기북부본부":     {"bias":"음수↓","detail":"음53%/중11%/양37%","pt_a":-0.30,"pt_c":+0.30,"cover":58,"cover_r":58,"note":"커버율 다소 낮음"},
     "한국전력공사 남서울본부":       {"bias":"균형", "detail":"음50%/중0%/양50%", "pt_a":-0.50,"pt_c":+0.10,"cover":62,"cover_r":0, "note":"A포인트 깊게"},
+    "한국전력공사 제주본부":         {"bias":"음수↓","detail":"음50%/중15%/양35%","pt_a":-0.40,"pt_c":+0.20,"cover":60,"cover_r":0, "note":"제주 표준"},
 }
+
+# 3포인트 적용 대상 여부 판단
+def is_three_pt_applicable(org, name):
+    """한전 발주처 + 복수예가 방식인 경우만 3포인트 적용"""
+    if not is_kepco(org):
+        return False
+    # 수의계약, 기초금액 매우 작은 건 제외
+    if any(kw in name for kw in ['수의','소액수의','전자견적']):
+        return False
+    return True
 
 # ── 기초금액 구간별 보정값 ─────────────────────────────────────
 AMT_BRACKETS = {
@@ -190,15 +203,42 @@ def analyze_pattern(org, df_c, pattern_stats):
     }
 
 def analyze_similar(name, base_원, df_c):
+    """② 유사표본 분석 — 이력 없으면 진단/감리 분야 전체평균으로 대체"""
     if df_c is None or base_원<=0: return None
-    kws=[kw for kw in ["PD","VLF","감리","진단","설계","측정","PQ","광학","초음파","콘크리트"] if kw in name]
+    kws=[kw for kw in ["PD","VLF","감리","진단","설계","측정","광학","초음파","콘크리트"] if kw in name]
     if not kws: kws=["감리"]
     mask=pd.Series([False]*len(df_c),index=df_c.index)
     for kw in kws: mask=mask|df_c["공고명"].str.contains(kw,na=False)
+    # ① 기초금액 ±50% 범위
     sim=df_c[mask&(df_c["기초금액"]>=base_원*0.5)&(df_c["기초금액"]<=base_원*1.5)]
+    # ② ±100% 범위로 확대
     if len(sim)<3:
         sim=df_c[mask&(df_c["기초금액"]>=base_원*0.3)&(df_c["기초금액"]<=base_원*2.0)]
-    if len(sim)<3: return None
+    # ③ 이력 부족 → 한전 포함 진단/감리 전체 평균으로 대체
+    if len(sim)<3:
+        if df_c is not None:
+            # 진단 분야 → 한전 진단 전체평균
+            if is_diag(name):
+                kepco_mask = df_c['발주기관'].str.contains('한국전력공사',na=False)
+                diag_mask  = df_c['공고명'].str.contains('|'.join(DIAG_KWS),na=False)
+                sim = df_c[kepco_mask & diag_mask]
+            # 감리 분야 → 한전 감리 전체평균
+            elif is_supervision(name):
+                kepco_mask = df_c['발주기관'].str.contains('한국전력공사',na=False)
+                sup_mask   = df_c['공고명'].str.contains('감리',na=False)
+                sim = df_c[kepco_mask & sup_mask]
+        if len(sim)<3: return None
+        # 대체 평균임을 표시
+        vals=sim["예가/기초(0%)"].values; n=len(vals)
+        weights=np.linspace(0.5,1.5,n)
+        co=sim["업체수"].mean() if "업체수" in sim.columns else None
+        return {
+            "pred":round(float(np.average(vals,weights=weights)),4),
+            "n":n,"mean":round(float(np.mean(vals)),4),
+            "std":round(float(np.std(vals)),4),
+            "avg_companies":round(float(co),1) if co and not np.isnan(float(co)) else None,
+            "keywords":kws,"fallback":True,"fallback_note":"분야 전체평균 대체"
+        }
     vals=sim["예가/기초(0%)"].values; n=len(vals)
     weights=np.linspace(0.5,1.5,n)
     co=sim["업체수"].mean() if "업체수" in sim.columns else None
@@ -206,10 +246,12 @@ def analyze_similar(name, base_원, df_c):
         "pred":round(float(np.average(vals,weights=weights)),4),
         "n":n,"mean":round(float(np.mean(vals)),4),
         "std":round(float(np.std(vals)),4),
-        "avg_companies":round(float(co),1) if co else None,"keywords":kws
+        "avg_companies":round(float(co),1) if co and not np.isnan(float(co)) else None,
+        "keywords":kws,"fallback":False
     }
 
 def analyze_trend(org, df_c):
+    """③ 트렌드 분석 — 최소값 보정 (±0.02% 미만 시 평균으로 보정)"""
     if df_c is None: return None
     sub=df_c[df_c["발주기관"]==org]
     vals=sub["예가/기초(0%)"].values
@@ -218,11 +260,15 @@ def analyze_trend(org, df_c):
     rm=float(np.mean(recent)); om=float(np.mean(older)) if len(older)>0 else rm
     drift=rm-om; r3=vals[-3:] if len(vals)>=3 else vals
     co=sub["업체수"].tail(rn).mean() if "업체수" in sub.columns else None
+    raw_pred = rm+drift*0.3
+    # ── 최소값 보정: 예측값이 ±0.02% 미만으로 0에 수렴하면 전체평균으로 대체
+    if abs(raw_pred) < 0.02:
+        raw_pred = float(np.mean(vals))
     return {
-        "pred":round(rm+drift*0.3,4),"recent_mean":round(rm,4),
+        "pred":round(raw_pred,4),"recent_mean":round(rm,4),
         "drift":round(drift,4),"recent_n":rn,
         "recent3_mean":round(float(np.mean(r3)),4),
-        "avg_companies":round(float(co),1) if co else None
+        "avg_companies":round(float(co),1) if co and not np.isnan(float(co)) else None
     }
 
 def recommend_range(a1,a2,a3):
@@ -633,7 +679,7 @@ def make_excel(results):
 st.markdown("""
 <div class="main-header">
 <h2>📊 투찰전략 분석 시스템</h2>
-<p style="margin:0;opacity:0.8">3가지 분석 + 3개 업체 분산투찰 전략 | v2.1 | 30,614건 기반</p>
+<p style="margin:0;opacity:0.8">3가지 분석 + 3개 업체 분산투찰 전략 | v2.2 | 30,614건+ 기반</p>
 </div>""", unsafe_allow_html=True)
 
 with st.sidebar:
@@ -739,9 +785,9 @@ else:
         lo,hi=recommend_range(a1,a2,a3)
         conv_std,conv_lbl=convergence_score(a1,a2,a3)
         amt_lbl,amt_adj,amt_note=get_amt_info(b["base_억"])
-        # 3포인트 전략
+        # 3포인트: 한전 + 수의계약 제외
         pred_val=a1["pred"] if a1 else 0.0
-        tp=get_three_pt(b["org"],pred_val) if is_kepco(b["org"]) else None
+        tp=get_three_pt(b["org"],pred_val) if is_three_pt_applicable(b["org"],b["name"]) else None
         results.append({"bid":b,"a1":a1,"a2":a2,"a3":a3,
                         "range_lo":lo,"range_hi":hi,
                         "conv_std":conv_std,"conv_lbl":conv_lbl,
@@ -809,10 +855,14 @@ else:
                     st.caption(f"r5={a1['r5']:+.4f} / r10={a1['r10']:+.4f} / 직전:{a1['last_val']:+.4f}%")
             with c2:
                 v=f"{a2['pred']:+.4f}%" if a2 else "이력없음"
-                st.markdown(f'<div class="val-box val-similar">②유사표본<br>{v}</div>',unsafe_allow_html=True)
+                fb = a2.get("fallback",False) if a2 else False
+                box_style = "val-similar" if not fb else "val-trend"
+                st.markdown(f'<div class="val-box {box_style}">②유사표본{"(대체)" if fb else ""}<br>{v}</div>',unsafe_allow_html=True)
                 if a2:
+                    if fb:
+                        st.caption(f"⚠️ {a2.get('fallback_note','분야평균 대체')}")
                     st.caption(f"유사 {a2['n']}건 | 평균:{a2['mean']:+.4f}%")
-                    if a2["avg_companies"]: st.caption(f"업체수 참고:{a2['avg_companies']}개")
+                    if a2.get("avg_companies"): st.caption(f"업체수 참고:{a2['avg_companies']}개")
             with c3:
                 v=f"{a3['pred']:+.4f}%" if a3 else "이력없음"
                 st.markdown(f'<div class="val-box val-trend">③트렌드<br>{v}</div>',unsafe_allow_html=True)
