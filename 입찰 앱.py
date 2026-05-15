@@ -286,19 +286,65 @@ def convergence_score(a1,a2,a3):
     elif sv<0.20: return sv,"★☆☆ 낮음"
     else:         return sv,"⚠️ 분산큼"
 
-def parse_xls(file_bytes):
-    wb=xlrd.open_workbook(file_contents=file_bytes,ignore_workbook_corruption=True)
-    ws=wb.sheets()[0]; headers=[ws.cell_value(1,c) for c in range(ws.ncols)]
-    bids=[]
-    for r in range(2,ws.nrows):
-        row={headers[c]:ws.cell_value(r,c) for c in range(ws.ncols)}
-        if not row.get("번호"): continue
-        base=float(row.get("기초금액") or 0)
-        bids.append({"no":int(row["번호"]),"name":row.get("공고명",""),
-                     "bid_no":row.get("공고번호",""),"base":base,
-                     "base_억":round(base/1e8,4) if base else 0,
-                     "deadline":row.get("투찰마감",""),"org":row.get("발주기관",""),
-                     "region":row.get("지역","")})
+def parse_xls(file_bytes, filename=""):
+    """입찰서류함 파일 파싱 — xls/xlsx 모두 지원"""
+    bids = []
+    # ── xlsx 형식 ────────────────────────────────────────────
+    is_xlsx = filename.lower().endswith(".xlsx") if filename else False
+    if not is_xlsx:
+        try:
+            # xlsx 매직바이트 확인 (PK = zip 헤더)
+            is_xlsx = file_bytes[:2] == b'PK'
+        except Exception:
+            is_xlsx = False
+
+    if is_xlsx:
+        import openpyxl
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
+        ws = wb.active
+        rows_data = list(ws.iter_rows(values_only=True))
+        wb.close()
+        if len(rows_data) < 3:
+            return bids
+        headers = [str(c) if c is not None else "" for c in rows_data[1]]
+        for row_vals in rows_data[2:]:
+            row = {headers[i]: row_vals[i] for i in range(len(headers))}
+            if not row.get("번호"):
+                continue
+            try:
+                base = float(row.get("기초금액") or 0)
+            except (ValueError, TypeError):
+                base = 0
+            bids.append({
+                "no":       int(float(row["번호"])),
+                "name":     str(row.get("공고명") or ""),
+                "bid_no":   str(row.get("공고번호") or ""),
+                "base":     base,
+                "base_억":  round(base/1e8, 4) if base else 0,
+                "deadline": str(row.get("투찰마감") or ""),
+                "org":      str(row.get("발주기관") or ""),
+                "region":   str(row.get("지역") or ""),
+            })
+    else:
+        # ── xls 형식 (나라장터 기본) ──────────────────────────
+        wb = xlrd.open_workbook(file_contents=file_bytes, ignore_workbook_corruption=True)
+        ws = wb.sheets()[0]
+        headers = [ws.cell_value(1, c) for c in range(ws.ncols)]
+        for r in range(2, ws.nrows):
+            row = {headers[c]: ws.cell_value(r, c) for c in range(ws.ncols)}
+            if not row.get("번호"):
+                continue
+            base = float(row.get("기초금액") or 0)
+            bids.append({
+                "no":       int(row["번호"]),
+                "name":     row.get("공고명", ""),
+                "bid_no":   row.get("공고번호", ""),
+                "base":     base,
+                "base_억":  round(base/1e8, 4) if base else 0,
+                "deadline": row.get("투찰마감", ""),
+                "org":      row.get("발주기관", ""),
+                "region":   row.get("지역", ""),
+            })
     return bids
 
 # ── 영문 변환 ─────────────────────────────────────────────────
@@ -771,7 +817,8 @@ else:
 
     with st.spinner("파일 읽는 중..."):
         try:
-            bids=parse_xls(xls_file.read())
+            raw_bytes = xls_file.read()
+            bids=parse_xls(raw_bytes, xls_file.name)
             if not bids: st.error("입찰 건을 읽을 수 없습니다."); st.stop()
         except Exception as e: st.error(f"파일 오류: {e}"); st.stop()
 
