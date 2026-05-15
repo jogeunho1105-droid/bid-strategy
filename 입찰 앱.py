@@ -818,9 +818,29 @@ else:
     with st.spinner("파일 읽는 중..."):
         try:
             raw_bytes = xls_file.read()
-            bids=parse_xls(raw_bytes, xls_file.name)
-            if not bids: st.error("입찰 건을 읽을 수 없습니다."); st.stop()
-        except Exception as e: st.error(f"파일 오류: {e}"); st.stop()
+            # 낙찰이력 파일 오업로드 감지 (5MB 이상 + xlsx)
+            if len(raw_bytes) > 3_000_000 and xls_file.name.lower().endswith(".xlsx"):
+                st.error(
+                    "⚠️ **잘못된 파일입니다.**\n\n"
+                    "- 지금 업로드한 파일: **낙찰이력 데이터** (배포자 관리 전용)\n"
+                    "- 여기서 필요한 파일: **나라장터 입찰서류함 xls**\n\n"
+                    "👉 낙찰이력 업로드는 **사이드바 → 배포자 관리** 에서 진행하세요."
+                )
+                st.stop()
+            bids = parse_xls(raw_bytes, xls_file.name)
+            if not bids:
+                st.error(
+                    "입찰 건을 읽을 수 없습니다.\n\n"
+                    "나라장터에서 다운받은 **입찰서류함 xls** 파일을 업로드해 주세요.\n"
+                    "낙찰이력 파일(낙찰데이터.xlsx)은 **배포자 관리** 탭에서 업로드하세요."
+                )
+                st.stop()
+        except Exception as e:
+            st.error(
+                f"파일 읽기 오류: {e}\n\n"
+                "나라장터 입찰서류함 xls 파일인지 확인해 주세요."
+            )
+            st.stop()
 
     st.success(f"✅ {len(bids)}건 확인")
     results=[]
