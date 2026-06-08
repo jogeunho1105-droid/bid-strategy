@@ -50,23 +50,26 @@ HISTORY_FILE = os.path.join(DATA_DIR, "history.pkl")
 PATTERN_FILE = os.path.join(DATA_DIR, "pattern_stats.json")
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# ── 3포인트 전략 DB (최신 낙찰이력 기반, 2026-05-13 업데이트) ─
+# ── 3포인트 전략 DB (분위수 기반, 30,614건 2026-05-13 업데이트) ─
+# A = 하위25% 분위수 / B = 예측중심(차트예측) / C = 상위75% 분위수
+# 실제 낙찰 분포는 ±1.5% 전 구간에 균등 분포 (복수예가 무작위 구조)
+# ①②③ 예측은 중앙경향성 / A·C는 실제 분포 커버 역할
 THREE_PT = {
-    "한국전력공사 경기본부":         {"bias":"음수↓","detail":"음60%/중13%/양27%","pt_a":-0.40,"pt_c":+0.20,"cover":63,"cover_r":73,"note":"음수편향 강함"},
-    "한국전력공사 부산울산본부":     {"bias":"음수↓","detail":"음55%/중23%/양23%","pt_a":-0.25,"pt_c":+0.35,"cover":62,"cover_r":87,"note":"최근커버 87% 우수"},
-    "한국전력공사 대전세종충남본부": {"bias":"균형", "detail":"음39%/중29%/양32%","pt_a":-0.35,"pt_c":+0.25,"cover":64,"cover_r":77,"note":"균형형. 최근커버 77%"},
-    "한국전력공사 인천본부":         {"bias":"양수↑","detail":"음31%/중12%/양56%","pt_a":-0.35,"pt_c":+0.30,"cover":64,"cover_r":75,"note":"양수편향. C포인트 주력"},
-    "한국전력공사 서울본부":         {"bias":"양수↑","detail":"음20%/중20%/양60%","pt_a":-0.35,"pt_c":+0.25,"cover":64,"cover_r":70,"note":"양수편향 매우 강함"},
-    "한국전력공사 경북본부":         {"bias":"음수↓","detail":"음47%/중18%/양35%","pt_a":-0.40,"pt_c":+0.20,"cover":63,"cover_r":71,"note":"음수편향. 표준전략"},
-    "한국전력공사 경남본부":         {"bias":"음수↓","detail":"음50%/중30%/양20%","pt_a":-0.40,"pt_c":+0.25,"cover":62,"cover_r":100,"note":"최근커버 100%!"},
-    "한국전력공사 광주전남본부":     {"bias":"음수↓","detail":"음52%/중10%/양38%","pt_a":-0.40,"pt_c":+0.20,"cover":61,"cover_r":67,"note":"수익성 주의"},
-    "한국전력공사 대구본부":         {"bias":"음수↓","detail":"음52%/중12%/양36%","pt_a":-0.45,"pt_c":+0.15,"cover":63,"cover_r":72,"note":"A포인트 깊게"},
-    "한국전력공사 강원본부":         {"bias":"음수↓","detail":"음53%/중13%/양33%","pt_a":-0.40,"pt_c":+0.20,"cover":63,"cover_r":93,"note":"최근커버 93% 우수"},
-    "한국전력공사 전북본부":         {"bias":"음수↓","detail":"음56%/중11%/양33%","pt_a":-0.30,"pt_c":+0.35,"cover":62,"cover_r":0, "note":"음수편향 표준"},
-    "한국전력공사 충북본부":         {"bias":"균형", "detail":"음47%/중3%/양50%", "pt_a":-0.30,"pt_c":+0.30,"cover":62,"cover_r":0, "note":"균형형"},
-    "한국전력공사 경기북부본부":     {"bias":"음수↓","detail":"음53%/중11%/양37%","pt_a":-0.30,"pt_c":+0.30,"cover":58,"cover_r":58,"note":"커버율 다소 낮음"},
-    "한국전력공사 남서울본부":       {"bias":"균형", "detail":"음50%/중0%/양50%", "pt_a":-0.50,"pt_c":+0.10,"cover":62,"cover_r":0, "note":"A포인트 깊게"},
-    "한국전력공사 제주본부":         {"bias":"음수↓","detail":"음50%/중15%/양35%","pt_a":-0.40,"pt_c":+0.20,"cover":60,"cover_r":0, "note":"제주 표준"},
+    "한국전력공사 경기본부":         {"bias":"음수↓","detail":"음60%/중13%/양27%","pt_a":-0.43,"pt_c":+0.27,"cover":67,"cover_r":73,"lo95":-1.01,"hi95":+0.96,"note":"분위수기반"},
+    "한국전력공사 부산울산본부":     {"bias":"음수↓","detail":"음55%/중23%/양23%","pt_a":-0.42,"pt_c":+0.29,"cover":71,"cover_r":87,"lo95":-1.07,"hi95":+0.91,"note":"최근커버 87%"},
+    "한국전력공사 대전세종충남본부": {"bias":"음수↓","detail":"음39%/중29%/양32%","pt_a":-0.45,"pt_c":+0.25,"cover":73,"cover_r":77,"lo95":-1.05,"hi95":+0.80,"note":"대형발주처"},
+    "한국전력공사 인천본부":         {"bias":"음수↓","detail":"음31%/중12%/양56%","pt_a":-0.40,"pt_c":+0.25,"cover":72,"cover_r":75,"lo95":-1.04,"hi95":+0.95,"note":"양수편향"},
+    "한국전력공사 서울본부":         {"bias":"양수↑","detail":"음20%/중20%/양60%","pt_a":-0.44,"pt_c":+0.20,"cover":60,"cover_r":70,"lo95":-1.07,"hi95":+0.83,"note":"양수편향 강함"},
+    "한국전력공사 경북본부":         {"bias":"균형", "detail":"음47%/중18%/양35%","pt_a":-0.38,"pt_c":+0.31,"cover":70,"cover_r":71,"lo95":-1.00,"hi95":+0.87,"note":"균형형"},
+    "한국전력공사 경남본부":         {"bias":"음수↓","detail":"음50%/중30%/양20%","pt_a":-0.44,"pt_c":+0.26,"cover":71,"cover_r":100,"lo95":-1.12,"hi95":+0.81,"note":"최근커버 100%!"},
+    "한국전력공사 광주전남본부":     {"bias":"음수↓","detail":"음52%/중10%/양38%","pt_a":-0.47,"pt_c":+0.24,"cover":68,"cover_r":67,"lo95":-1.08,"hi95":+0.86,"note":"음수편향"},
+    "한국전력공사 대구본부":         {"bias":"음수↓","detail":"음52%/중12%/양36%","pt_a":-0.43,"pt_c":+0.24,"cover":71,"cover_r":72,"lo95":-1.08,"hi95":+0.84,"note":"음수편향"},
+    "한국전력공사 강원본부":         {"bias":"음수↓","detail":"음53%/중13%/양33%","pt_a":-0.45,"pt_c":+0.24,"cover":65,"cover_r":93,"lo95":-1.05,"hi95":+0.83,"note":"최근커버 93%"},
+    "한국전력공사 전북본부":         {"bias":"음수↓","detail":"음56%/중11%/양33%","pt_a":-0.48,"pt_c":+0.24,"cover":73,"cover_r":0, "lo95":-1.08,"hi95":+0.81,"note":"음수편향"},
+    "한국전력공사 충북본부":         {"bias":"음수↓","detail":"음47%/중3%/양50%", "pt_a":-0.43,"pt_c":+0.28,"cover":72,"cover_r":0, "lo95":-1.01,"hi95":+0.88,"note":"균형형"},
+    "한국전력공사 경기북부본부":     {"bias":"균형", "detail":"음53%/중11%/양37%","pt_a":-0.46,"pt_c":+0.30,"cover":70,"cover_r":58,"lo95":-1.07,"hi95":+0.87,"note":"균형형"},
+    "한국전력공사 남서울본부":       {"bias":"균형", "detail":"음50%/중0%/양50%", "pt_a":-0.42,"pt_c":+0.29,"cover":72,"cover_r":0, "lo95":-1.03,"hi95":+0.92,"note":"균형형"},
+    "한국전력공사 제주본부":         {"bias":"음수↓","detail":"음50%/중15%/양35%","pt_a":-0.45,"pt_c":+0.18,"cover":69,"cover_r":0, "lo95":-1.13,"hi95":+0.73,"note":"제주"},
 }
 
 # 3포인트 적용 대상 여부 판단
@@ -872,6 +875,7 @@ else:
         grade=a1.get("grade","?") if a1 else "?"
         ge={"A":"🟢","B":"🔵","C":"🟡","D":"🔴"}.get(grade,"⚪")
         tp_str=f"A:{tp['pt_a']:+.2f} B:{tp['pt_b']:+.4f} C:{tp['pt_c']:+.2f} ({tp['cover']}%)" if tp else "-"
+        lo95_str=f"{tp['lo95']:+.2f}~{tp['hi95']:+.2f}%" if (tp and tp.get('lo95')) else "-"
         rows.append({"No":b["no"],
             "공고명":b["name"][:33]+"…" if len(b["name"])>33 else b["name"],
             "발주기관":b["org"].replace("한국전력공사 ","한전 "),
@@ -883,7 +887,8 @@ else:
             "💡하한":f"{lo:+.4f}%" if lo else "-",
             "💡상한":f"{hi:+.4f}%" if hi else "-",
             "수렴도":row["conv_lbl"],"등급":f"{ge}{grade}",
-            "3포인트":tp_str})
+            "3포인트":tp_str,
+            "실분포95%":lo95_str})
     st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True,
                  column_config={"No":st.column_config.NumberColumn(width=50),
                                 "공고명":st.column_config.TextColumn(width=200),
@@ -920,6 +925,8 @@ else:
                 if a1:
                     st.caption(f"n={a1['n']}건 | {a1['trend']} | {a1['pattern']}패턴")
                     st.caption(f"r5={a1['r5']:+.4f} / r10={a1['r10']:+.4f} / 직전:{a1['last_val']:+.4f}%")
+                    if a1.get("std",0) > 0.3:
+                        st.caption(f"⚠️ std={a1['std']:.3f}% — 실제분포 넓음")
             with c2:
                 v=f"{a2['pred']:+.4f}%" if a2 else "이력없음"
                 fb = a2.get("fallback",False) if a2 else False
@@ -949,31 +956,37 @@ else:
             # ── 3포인트 분산투찰 카드 (한전만) ───────────────
             if tp:
                 st.markdown("---")
-                bias_color="#991b1b" if "음수" in tp["bias"] else "#15803d" if "양수" in tp["bias"] else "#475569"
                 bias_icon="🔵" if "음수" in tp["bias"] else "🔴" if "양수" in tp["bias"] else "⚪"
                 cover_r_str=f" | 최근커버: **{tp['cover_r']}%**" if tp['cover_r']>0 else ""
+                lo95=tp.get("lo95",0); hi95=tp.get("hi95",0)
                 st.markdown(
                     f"**🏢 3개 업체 분산투찰 전략** &nbsp;"
-                    f"{bias_icon} 발주처편향: **{tp['bias']}** ({tp['detail']}) &nbsp;|&nbsp; "
-                    f"전체커버: **{tp['cover']}%**{cover_r_str} &nbsp;|&nbsp; "
-                    f"_{tp['note']}_",
+                    f"{bias_icon} 편향: **{tp['bias']}** ({tp['detail']}) &nbsp;|&nbsp; "
+                    f"커버율: **{tp['cover']}%**{cover_r_str}",
                     unsafe_allow_html=False
                 )
+                # ── 복수예가 분포 안내 ──────────────────────────
+                if lo95 and hi95:
+                    st.info(
+                        f"📊 **복수예가 실제 분포 안내** — "
+                        f"실제 낙찰은 **{lo95:+.2f}% ~ {hi95:+.2f}%** 전 구간에 균등 분포합니다 (95% 범위). "
+                        f"①②③ 예측값은 중앙경향성(평균 근처)이며, "
+                        f"업체A·C는 실제 분포의 **하위25%({tp['pt_a']:+.2f}%)·상위75%({tp['pt_c']:+.2f}%)** 구간을 커버합니다."
+                    )
                 ca,cb,cc=st.columns(3)
                 with ca:
                     amt_a=f"\n{int(b['base']*(100+tp['pt_a'])/100):,}원" if b['base']>0 else ""
                     st.markdown(f'<div class="val-a">🏢 업체A<br>{tp["pt_a"]:+.2f}%{amt_a}</div>',unsafe_allow_html=True)
-                    if "음수" in tp["bias"]: st.caption("▶ 음수편향 주력")
-                    else: st.caption("▶ 음수 헷지")
+                    st.caption(f"▶ 하위25% 분위수 | {'음수주력' if '음수' in tp['bias'] else '음수헷지'}")
+                    if b['base']>0: st.caption(f"※ 수익성 검토 필요")
                 with cb:
                     amt_b=f"\n{int(b['base']*(100+tp['pt_b'])/100):,}원" if b['base']>0 else ""
                     st.markdown(f'<div class="val-b">🏢 업체B (차트예측)<br>{tp["pt_b"]:+.4f}%{amt_b}</div>',unsafe_allow_html=True)
-                    st.caption("▶ 기존 차트분석값 유지")
+                    st.caption("▶ 중앙경향성 예측값 (핵심 포인트)")
                 with cc:
                     amt_c=f"\n{int(b['base']*(100+tp['pt_c'])/100):,}원" if b['base']>0 else ""
                     st.markdown(f'<div class="val-c">🏢 업체C<br>{tp["pt_c"]:+.2f}%{amt_c}</div>',unsafe_allow_html=True)
-                    if "양수" in tp["bias"]: st.caption("▶ 양수편향 주력")
-                    else: st.caption("▶ 양수 헷지")
+                    st.caption(f"▶ 상위75% 분위수 | {'양수주력' if '양수' in tp['bias'] else '양수헷지'}")
 
             # ── 흐름 차트 ─────────────────────────────────────
             if a1 and (a1.get("all_vals") or a1.get("recent10")):
