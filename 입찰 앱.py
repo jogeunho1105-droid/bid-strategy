@@ -746,35 +746,42 @@ def simple_flow_data(df_c, bid, max_n=30):
 def make_simple_flow_chart(df_c, bid, max_n=30):
     data=simple_flow_data(df_c,bid,max_n=max_n)
     if not data: return None, None
-    fig,ax=plt.subplots(figsize=(12,3.8),facecolor="#ffffff")
-    ax.set_facecolor("#ffffff")
-    ax.axhline(0,color="#94a3b8",lw=1.0,alpha=0.9)
+    fig,axes=plt.subplots(2,1,figsize=(12,5.8),facecolor="#ffffff",sharex=False)
+    fig.suptitle(
+        f"Adjustment Rate Trend - Agency vs {data['service_chart_label']}",
+        fontsize=11,fontweight="bold",color="#1f2937",y=0.98
+    )
 
-    def draw(vals,label,color,marker,label_pos="up"):
-        if not vals: return
+    def draw(ax,vals,label,color,marker):
+        ax.set_facecolor("#ffffff")
+        ax.axhline(0,color="#94a3b8",lw=1.0,alpha=0.9)
+        ax.set_title(label,fontsize=9.5,fontweight="bold",color=color,loc="left",pad=5)
+        ax.grid(axis="y",alpha=0.22,ls="--")
+        ax.tick_params(labelsize=8)
+        ax.set_ylabel("Rate (%)",fontsize=8.5)
+        if not vals:
+            ax.text(0.5,0.5,"No data",transform=ax.transAxes,ha="center",va="center",
+                    fontsize=9,color="#64748b")
+            return
         x=np.arange(1,len(vals)+1)
-        ax.plot(x,vals,color=color,lw=1.9,marker=marker,ms=4.5,label=f"{label} (n={len(vals)})")
+        ax.plot(x,vals,color=color,lw=1.9,marker=marker,ms=4.5)
         ax.scatter([x[-1]],[vals[-1]],s=50,color=color,zorder=5,edgecolor="white",linewidth=1.0)
-        yoff=9 if label_pos=="up" else -13
-        va="bottom" if label_pos=="up" else "top"
-        for xi,yi in zip(x,vals):
-            ax.annotate(f"{yi:+.4f}",xy=(xi,yi),xytext=(0,yoff),
+        for idx,(xi,yi) in enumerate(zip(x,vals)):
+            if idx==0:
+                delta_txt="base"
+            else:
+                delta_txt=f"{yi-vals[idx-1]:+.4f}"
+            yoff=9 if yi>=0 else -11
+            va="bottom" if yi>=0 else "top"
+            ax.annotate(f"{yi:+.4f}\n({delta_txt})",xy=(xi,yi),xytext=(0,yoff),
                         textcoords="offset points",ha="center",va=va,
                         fontsize=6.5,color=color,fontweight="bold")
+        ax.margins(x=0.03,y=0.34)
 
-    draw(data["org_vals"],data["org_chart_label"],"#2563eb","o","up")
-    draw(data["svc_vals"],data["svc_chart_label"],"#16a34a","s","down")
-    ax.set_title(
-        f"Adjustment Rate Trend - Agency vs {data['service_chart_label']}",
-        fontsize=11,fontweight="bold",color="#1f2937",pad=10
-    )
-    ax.set_ylabel("Adjustment rate (%)",fontsize=9)
-    ax.set_xlabel("Recent result order",fontsize=9)
-    ax.grid(axis="y",alpha=0.22,ls="--")
-    ax.tick_params(labelsize=8)
-    ax.legend(loc="upper left",frameon=False,fontsize=9)
-    ax.margins(x=0.03,y=0.18)
-    plt.tight_layout()
+    draw(axes[0],data["org_vals"],f"{data['org_chart_label']} (n={len(data['org_vals'])})","#2563eb","o")
+    draw(axes[1],data["svc_vals"],f"{data['svc_chart_label']} (n={len(data['svc_vals'])})","#16a34a","s")
+    axes[1].set_xlabel("Recent result order",fontsize=8.5)
+    plt.tight_layout(rect=[0,0,1,0.95])
     buf=io.BytesIO()
     plt.savefig(buf,format="png",dpi=140,bbox_inches="tight",facecolor="#ffffff")
     buf.seek(0); plt.close()
