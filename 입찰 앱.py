@@ -706,6 +706,65 @@ def make_flow_chart(a1,a2,a3,lo,hi,org_raw,three_pt=None):
     plt.savefig(buf,format="png",dpi=140,bbox_inches="tight",facecolor="#f8fafc")
     buf.seek(0); plt.close(); return buf
 
+def simple_flow_data(df_c, bid, max_n=30):
+    if df_c is None or len(df_c)==0: return None
+    d=df_c if "_service" in df_c.columns else enrich_history(df_c)
+    if len(d)==0 or "예가/기초(0%)" not in d.columns: return None
+    org=str(bid.get("org",""))
+    svc=classify_service(bid.get("name",""))
+    org_df=d[d["발주기관"].astype(str)==org] if "발주기관" in d.columns else d.iloc[0:0]
+    svc_df=org_df[org_df["_service"]==svc] if "_service" in org_df.columns else d.iloc[0:0]
+    svc_scope="해당 발주처 내 해당분야"
+    if len(svc_df)<3 and "_service" in d.columns:
+        svc_df=d[d["_service"]==svc]
+        svc_scope="전체 발주처 해당분야"
+    org_vals=org_df["예가/기초(0%)"].dropna().astype(float).tail(max_n).to_list()
+    svc_vals=svc_df["예가/기초(0%)"].dropna().astype(float).tail(max_n).to_list()
+    if len(org_vals)==0 and len(svc_vals)==0: return None
+    return {
+        "org_label":"해당 발주처 전체",
+        "svc_label":svc_scope,
+        "service_label":SERVICE_LABELS.get(svc,svc),
+        "org_vals":org_vals,
+        "svc_vals":svc_vals,
+        "org_n":int(len(org_df)),
+        "svc_n":int(len(svc_df)),
+    }
+
+def make_simple_flow_chart(df_c, bid, max_n=30):
+    data=simple_flow_data(df_c,bid,max_n=max_n)
+    if not data: return None, None
+    fig,ax=plt.subplots(figsize=(12,3.8),facecolor="#ffffff")
+    ax.set_facecolor("#ffffff")
+    ax.axhline(0,color="#94a3b8",lw=1.0,alpha=0.9)
+
+    def draw(vals,label,color,marker):
+        if not vals: return
+        x=np.arange(1,len(vals)+1)
+        ax.plot(x,vals,color=color,lw=1.9,marker=marker,ms=4.5,label=f"{label} (n={len(vals)})")
+        ax.scatter([x[-1]],[vals[-1]],s=50,color=color,zorder=5,edgecolor="white",linewidth=1.0)
+        ax.annotate(f"{vals[-1]:+.4f}",xy=(x[-1],vals[-1]),xytext=(8,0),
+                    textcoords="offset points",va="center",fontsize=8,
+                    color=color,fontweight="bold")
+
+    draw(data["org_vals"],data["org_label"],"#2563eb","o")
+    draw(data["svc_vals"],data["svc_label"],"#16a34a","s")
+    ax.set_title(
+        f"{bid.get('org','')} | {data['service_label']} 사정율 흐름",
+        fontsize=11,fontweight="bold",color="#1f2937",pad=10
+    )
+    ax.set_ylabel("예가/기초 사정율(%)",fontsize=9)
+    ax.set_xlabel("최근 이력 순서",fontsize=9)
+    ax.grid(axis="y",alpha=0.22,ls="--")
+    ax.tick_params(labelsize=8)
+    ax.legend(loc="upper left",frameon=False,fontsize=9)
+    ax.margins(x=0.03,y=0.18)
+    plt.tight_layout()
+    buf=io.BytesIO()
+    plt.savefig(buf,format="png",dpi=140,bbox_inches="tight",facecolor="#ffffff")
+    buf.seek(0); plt.close()
+    return buf, data
+
 # ── 한전 세분화 함수 ──────────────────────────────────────────
 DIAG_KWS=['광학','초음파','VLF','PD','콘크리트']
 
@@ -1218,49 +1277,30 @@ else:
                     st.markdown(f'<div class="val-c">🏢 업체C<br>{tp["pt_c"]:+.2f}%{amt_c}</div>',unsafe_allow_html=True)
                     st.caption(f"▶ 상위75% 분위수 | {'양수주력' if '양수' in tp['bias'] else '양수헷지'}")
 
-            # ── 흐름 차트 ─────────────────────────────────────
-            if a1 and (a1.get("all_vals") or a1.get("recent10")):
-                st.markdown("---")
-                with st.spinner("차트 생성 중..."):
-                    chart_buf=make_flow_chart(a1,a2,a3,rec_lo,rec_hi,b["org"],tp)
-                if chart_buf: st.image(chart_buf,use_container_width=True)
+            # ── 사정율 흐름 차트: 발주처 전체 vs 해당분야 ───────
+            st.markdown("---")
+            st.markdown("**사정율 흐름 차트**")
+            with st.spinner("단순 비교차트 생성 중..."):
+                chart_buf,chart_data=make_simple_flow_chart(df_model,b,max_n=30)
+            if chart_buf:
+                m1,m2=st.columns(2)
+                with m1:
+                    vals=chart_data["org_vals"]
+                    st.metric(
+                        "해당 발주처 전체",
+                        f"{np.mean(vals):+.4f}%" if vals else "-",
+                        f"표본 {chart_data['org_n']}건"
+                    )
+                with m2:
+                    vals=chart_data["svc_vals"]
+                    st.metric(
+                        f"{chart_data['service_label']} 분야",
+                        f"{np.mean(vals):+.4f}%" if vals else "-",
+                        f"{chart_data['svc_label']} {chart_data['svc_n']}건"
+                    )
+                st.image(chart_buf,use_container_width=True)
             else:
-                st.caption("⚠️ 이력 데이터 부족")
-
-            # ── 한전 세분화 차트 ──────────────────────────────
-            if is_kepco(b["org"]) and df_c is not None:
-                if is_diag(b["name"]):
-                    st.markdown("---")
-                    st.markdown(f"**📡 ENG 진단 분야 세분화** (광학·초음파·VLF·PD·콘크리트)")
-                    d_all=analyze_diag_all(df_c); d_org=analyze_diag_org(b["org"],df_c)
-                    if d_all or d_org:
-                        col_da,col_db=st.columns(2)
-                        with col_da:
-                            if d_all: st.metric("전체 한전 진단 평균",f"{d_all['pred']:+.4f}%",f"n={d_all['n']}건")
-                        with col_db:
-                            if d_org:
-                                org_s=b['org'].replace('한국전력공사 ','').replace('본부','')
-                                st.metric(f"{org_s} 진단 평균",f"{d_org['pred']:+.4f}%",f"n={d_org['n']}건")
-                        with st.spinner("진단 비교차트..."):
-                            sec_buf=make_sector_chart(d_all,d_org,rec_lo,rec_hi,
-                                f"ENG Diagnosis — All KEPCO vs {tr_org(b['org'])}")
-                        if sec_buf: st.image(sec_buf,use_container_width=True)
-                elif is_supervision(b["name"]):
-                    st.markdown("---")
-                    st.markdown("**🏗️ 감리 분야 세분화**")
-                    s_all=analyze_sup_all(df_c); s_org=analyze_sup_org(b["org"],df_c)
-                    if s_all or s_org:
-                        col_sa,col_sb=st.columns(2)
-                        with col_sa:
-                            if s_all: st.metric("전체 한전 감리 평균",f"{s_all['pred']:+.4f}%",f"n={s_all['n']}건")
-                        with col_sb:
-                            if s_org:
-                                org_s=b['org'].replace('한국전력공사 ','').replace('본부','')
-                                st.metric(f"{org_s} 감리 평균",f"{s_org['pred']:+.4f}%",f"n={s_org['n']}건")
-                        with st.spinner("감리 비교차트..."):
-                            sec_buf=make_sector_chart(s_all,s_org,rec_lo,rec_hi,
-                                f"Supervision — All KEPCO vs {tr_org(b['org'])}")
-                        if sec_buf: st.image(sec_buf,use_container_width=True)
+                st.caption("⚠️ 차트에 표시할 이력 데이터가 부족합니다.")
 
     st.divider()
     st.subheader("💾 전략표 다운로드")
