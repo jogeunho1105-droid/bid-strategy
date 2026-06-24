@@ -713,7 +713,7 @@ def make_flow_chart(a1,a2,a3,lo,hi,org_raw,three_pt=None):
     plt.savefig(buf,format="png",dpi=140,bbox_inches="tight",facecolor="#f8fafc")
     buf.seek(0); plt.close(); return buf
 
-def simple_flow_data(df_c, bid, max_n=30):
+def simple_flow_data(df_c, bid, max_n=20):
     if df_c is None or len(df_c)==0: return None
     d=df_c if "_service" in df_c.columns else enrich_history(df_c)
     if len(d)==0 or "예가/기초(0%)" not in d.columns: return None
@@ -743,7 +743,7 @@ def simple_flow_data(df_c, bid, max_n=30):
         "svc_n":int(len(svc_df)),
     }
 
-def make_simple_flow_chart(df_c, bid, max_n=30):
+def make_simple_flow_chart(df_c, bid, max_n=20):
     data=simple_flow_data(df_c,bid,max_n=max_n)
     if not data: return None, None
     fig,axes=plt.subplots(2,1,figsize=(12,5.8),facecolor="#ffffff",sharex=False)
@@ -1303,7 +1303,7 @@ else:
             st.markdown("---")
             st.markdown("**사정율 흐름 차트**")
             with st.spinner("단순 비교차트 생성 중..."):
-                chart_buf,chart_data=make_simple_flow_chart(df_model,b,max_n=30)
+                chart_buf,chart_data=make_simple_flow_chart(df_model,b,max_n=20)
             if chart_buf:
                 m1,m2=st.columns(2)
                 with m1:
