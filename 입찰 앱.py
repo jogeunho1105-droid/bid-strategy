@@ -298,6 +298,13 @@ SERVICE_LABELS = {
     "other":"기타"
 }
 
+SERVICE_CHART_LABELS = {
+    "PD":"PD", "VLF":"VLF", "optical":"Optical", "concrete":"Concrete",
+    "ultrasound":"Ultrasound", "supervision":"Supervision", "design":"Design",
+    "construction_management":"Construction Management",
+    "diagnosis_other":"Diagnosis", "other":"Other"
+}
+
 MODEL_LABELS = {
     "svc_amount_recent20":"용역성격+금액구간 최근20건",
     "blend_weighted":"가중혼합",
@@ -715,9 +722,11 @@ def simple_flow_data(df_c, bid, max_n=30):
     org_df=d[d["발주기관"].astype(str)==org] if "발주기관" in d.columns else d.iloc[0:0]
     svc_df=org_df[org_df["_service"]==svc] if "_service" in org_df.columns else d.iloc[0:0]
     svc_scope="해당 발주처 내 해당분야"
+    svc_chart_scope="Same agency service"
     if len(svc_df)<3 and "_service" in d.columns:
         svc_df=d[d["_service"]==svc]
         svc_scope="전체 발주처 해당분야"
+        svc_chart_scope="All agencies service"
     org_vals=org_df["예가/기초(0%)"].dropna().astype(float).tail(max_n).to_list()
     svc_vals=svc_df["예가/기초(0%)"].dropna().astype(float).tail(max_n).to_list()
     if len(org_vals)==0 and len(svc_vals)==0: return None
@@ -725,6 +734,9 @@ def simple_flow_data(df_c, bid, max_n=30):
         "org_label":"해당 발주처 전체",
         "svc_label":svc_scope,
         "service_label":SERVICE_LABELS.get(svc,svc),
+        "org_chart_label":"Agency all",
+        "svc_chart_label":svc_chart_scope,
+        "service_chart_label":SERVICE_CHART_LABELS.get(svc,svc),
         "org_vals":org_vals,
         "svc_vals":svc_vals,
         "org_n":int(len(org_df)),
@@ -738,23 +750,26 @@ def make_simple_flow_chart(df_c, bid, max_n=30):
     ax.set_facecolor("#ffffff")
     ax.axhline(0,color="#94a3b8",lw=1.0,alpha=0.9)
 
-    def draw(vals,label,color,marker):
+    def draw(vals,label,color,marker,label_pos="up"):
         if not vals: return
         x=np.arange(1,len(vals)+1)
         ax.plot(x,vals,color=color,lw=1.9,marker=marker,ms=4.5,label=f"{label} (n={len(vals)})")
         ax.scatter([x[-1]],[vals[-1]],s=50,color=color,zorder=5,edgecolor="white",linewidth=1.0)
-        ax.annotate(f"{vals[-1]:+.4f}",xy=(x[-1],vals[-1]),xytext=(8,0),
-                    textcoords="offset points",va="center",fontsize=8,
-                    color=color,fontweight="bold")
+        yoff=9 if label_pos=="up" else -13
+        va="bottom" if label_pos=="up" else "top"
+        for xi,yi in zip(x,vals):
+            ax.annotate(f"{yi:+.4f}",xy=(xi,yi),xytext=(0,yoff),
+                        textcoords="offset points",ha="center",va=va,
+                        fontsize=6.5,color=color,fontweight="bold")
 
-    draw(data["org_vals"],data["org_label"],"#2563eb","o")
-    draw(data["svc_vals"],data["svc_label"],"#16a34a","s")
+    draw(data["org_vals"],data["org_chart_label"],"#2563eb","o","up")
+    draw(data["svc_vals"],data["svc_chart_label"],"#16a34a","s","down")
     ax.set_title(
-        f"{bid.get('org','')} | {data['service_label']} 사정율 흐름",
+        f"Adjustment Rate Trend - Agency vs {data['service_chart_label']}",
         fontsize=11,fontweight="bold",color="#1f2937",pad=10
     )
-    ax.set_ylabel("예가/기초 사정율(%)",fontsize=9)
-    ax.set_xlabel("최근 이력 순서",fontsize=9)
+    ax.set_ylabel("Adjustment rate (%)",fontsize=9)
+    ax.set_xlabel("Recent result order",fontsize=9)
     ax.grid(axis="y",alpha=0.22,ls="--")
     ax.tick_params(labelsize=8)
     ax.legend(loc="upper left",frameon=False,fontsize=9)
