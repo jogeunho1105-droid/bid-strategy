@@ -1,12 +1,12 @@
 # ╔══════════════════════════════════════════════════════════════════╗
-# ║  투찰전략 분석 시스템 v2.7                                      ║
-# ║  개선: 백테스트 기반 추천모델 + 목표 적중률 추천구간             ║
+# ║  투찰전략 분석 시스템 v2.8                                      ║
+# ║  개선: 백테스트 기반 3개 업체 추천 사정율                       ║
 # ║  - 비한전/조달청: 3포인트 미적용, 단일전략 표시                 ║
 # ║  - ③트렌드 최소값 보정 (±0.02% 미만 시 보정)                  ║
 # ║  - ②유사표본 없을 때 진단/감리 분야 전체평균으로 대체           ║
 # ║  - 진단 분야 세분화 예측값 → ②유사표본에 통합                  ║
 # ║  - 용역성격별 최적모델로 추천 중심값 산정                       ║
-# ║  - 60/70/80% 목표 적중률별 추천 사정율 하한/상한                ║
+# ║  - 관련 이력 분위수 + 백테스트 중심값과 산정 근거 제공          ║
 # ╚══════════════════════════════════════════════════════════════════╝
 
 import streamlit as st
@@ -456,7 +456,7 @@ def pick_candidate(model, candidates):
             return key, val
     return None, None
 
-def analyze_improved_model(bid, df_c, target_hit=70):
+def analyze_improved_model(bid, df_c):
     if df_c is None or len(df_c)==0: return None
     svc=classify_service(bid.get("name",""))
     rule=MODEL_RULES.get(svc, MODEL_RULES["_default"])
@@ -464,8 +464,6 @@ def analyze_improved_model(bid, df_c, target_hit=70):
     candidates,pools=build_model_candidates(bid, df_e)
     model_used,pred=pick_candidate(rule["model"], candidates)
     if pred is None: return None
-    scale=TARGET_SCALE.get(int(target_hit), 1.0)
-    half=float(rule["p70"])*scale
     basis_pool=pools.get("발주처+용역성격")
     if basis_pool is None or len(basis_pool)<5:
         basis_pool=pools.get("용역성격")
@@ -474,19 +472,49 @@ def analyze_improved_model(bid, df_c, target_hit=70):
     svc_label=SERVICE_LABELS.get(svc, svc)
     return {
         "pred":round(float(pred),4),
-        "lo":round(float(pred)-half,4),
-        "hi":round(float(pred)+half,4),
         "service":svc,
         "service_label":svc_label,
         "model":model_used,
         "model_label":model_label,
-        "target_hit":int(target_hit),
         "mae":round(float(rule["mae"]),4),
-        "half_width":round(half,4),
         "basis_n":int(basis_n),
         "basis":f"{svc_label} 분류 후 백테스트 최적모델({model_label}) 적용",
         "candidates":{k:round(float(v),4) for k,v in candidates.items() if v is not None},
     }
+
+def build_company_recommendations(bid, improved, a1, a2, a3, df_c):
+    """관련 이력의 25/75% 분위수와 백테스트 중심값으로 3개 업체 값을 만든다."""
+    if df_c is None or len(df_c)==0:
+        return None
+    df_e=df_c if "_service" in df_c.columns else enrich_history(df_c)
+    rate="예가/기초(0%)"
+    svc=classify_service(bid.get("name",""))
+    org=str(bid.get("org",""))
+    valid=df_e[df_e[rate].notna() & (df_e[rate].abs()<10)].copy()
+    pools=[
+        ("동일 발주처·동일 분야", valid[(valid["발주기관"].astype(str)==org) & (valid["_service"]==svc)]),
+        ("동일 발주처", valid[valid["발주기관"].astype(str)==org]),
+        ("동일 분야", valid[valid["_service"]==svc]),
+        ("전체 낙찰이력", valid),
+    ]
+    pool_label,pool=next(((label,data) for label,data in pools if len(data)>=8), pools[-1])
+    if len(pool)==0:
+        return None
+    recent=history_sorted(pool).tail(100)
+    q25=float(recent[rate].quantile(.25))
+    q75=float(recent[rate].quantile(.75))
+    fallback=[x["pred"] for x in (a1,a2,a3) if x]
+    center=float(improved["pred"]) if improved else float(np.mean(fallback)) if fallback else float(recent[rate].median())
+    center_basis=(
+        f"{improved['service_label']} 분류, {improved['model_label']} 적용, 근거 {improved['basis_n']}건"
+        if improved else f"①패턴·②유사표본·③트렌드의 사용 가능한 분석값 평균"
+    )
+    n=len(recent)
+    return [
+        {"company":"업체 1", "rate":round(q25,4), "basis":f"{pool_label} 최근 {n}건의 25% 분위수"},
+        {"company":"업체 2", "rate":round(center,4), "basis":center_basis},
+        {"company":"업체 3", "rate":round(q75,4), "basis":f"{pool_label} 최근 {n}건의 75% 분위수"},
+    ]
 
 def parse_xls(file_bytes, filename=""):
     """입찰서류함 파일 파싱 — xls/xlsx 모두 지원"""
@@ -1009,25 +1037,70 @@ def make_excel(results):
 
     buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf
 
+def make_excel_simple(results):
+    """화면과 동일하게 3개 업체 추천값과 산정 근거만 내보낸다."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    wb=Workbook(); ws=wb.active; ws.title="업체별 추천"
+    ws.sheet_view.showGridLines=False
+    navy="FF1a2744"; fills=["FFfee2e2","FFdbeafe","FFdcfce7"]
+    thin=Side(style="thin",color="FFd1d5db")
+    border=Border(left=thin,right=thin,top=thin,bottom=thin)
+    headers=["No","공고번호","공고명","발주기관","기초금액(억)","마감",
+             "업체 1 추천(%)","업체 1 산정 근거",
+             "업체 2 추천(%)","업체 2 산정 근거",
+             "업체 3 추천(%)","업체 3 산정 근거"]
+    widths=[6,18,44,22,14,14,15,34,15,42,15,34]
+    ws.merge_cells(start_row=1,start_column=1,end_row=1,end_column=len(headers))
+    title=ws.cell(1,1,f"3개 업체 추천 사정율 — {datetime.now().strftime('%Y.%m.%d')}")
+    title.font=Font(name="맑은 고딕",bold=True,size=14,color="FFFFFFFF")
+    title.fill=PatternFill("solid",start_color=navy)
+    title.alignment=Alignment(horizontal="center",vertical="center")
+    ws.row_dimensions[1].height=30
+    for col,(header,width) in enumerate(zip(headers,widths),1):
+        cell=ws.cell(2,col,header)
+        cell.font=Font(name="맑은 고딕",bold=True,color="FFFFFFFF")
+        cell.fill=PatternFill("solid",start_color=navy)
+        cell.alignment=Alignment(horizontal="center",vertical="center",wrap_text=True)
+        cell.border=border
+        ws.column_dimensions[get_column_letter(col)].width=width
+    for idx,row in enumerate(results,3):
+        bid=row["bid"]; recs=row.get("recommendations") or []
+        base=[bid["no"],bid.get("bid_no",""),bid["name"],bid["org"],
+              bid["base_억"] if bid["base"]>0 else "미정",bid["deadline"]]
+        values=list(base)
+        for pos in range(3):
+            rec=recs[pos] if pos<len(recs) else None
+            values.extend([rec["rate"] if rec else "-",rec["basis"] if rec else "데이터 부족"])
+        for col,value in enumerate(values,1):
+            cell=ws.cell(idx,col,value)
+            cell.font=Font(name="맑은 고딕",size=9,bold=col in (7,9,11))
+            cell.alignment=Alignment(horizontal="right" if col in (5,7,9,11) else "left",
+                                     vertical="center",wrap_text=True)
+            cell.border=border
+            if col in (7,8): cell.fill=PatternFill("solid",start_color=fills[0])
+            if col in (9,10): cell.fill=PatternFill("solid",start_color=fills[1])
+            if col in (11,12): cell.fill=PatternFill("solid",start_color=fills[2])
+            if col in (7,9,11) and isinstance(value,(int,float)):
+                cell.number_format="+0.0000;-0.0000"
+        ws.row_dimensions[idx].height=36
+    ws.freeze_panes="A3"
+    buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+
 # ════════════════════════════════════════════════════════════════
 #  메인 UI
 # ════════════════════════════════════════════════════════════════
 st.markdown("""
 <div class="main-header">
-<h2>📊 투찰전략 분석 시스템 v2.7</h2>
-<p style="margin:0;opacity:0.8">백테스트 기반 개선추천 + 기존 3가지 분석 + 3개 업체 분산투찰 전략</p>
+<h2>📊 투찰전략 분석 시스템 v2.8</h2>
+<p style="margin:0;opacity:0.8">3개 업체 추천 사정율과 산정 근거</p>
 </div>""", unsafe_allow_html=True)
 
 with st.sidebar:
     st.header("⚙️ 시스템 설정")
     mode=st.radio("모드 선택",["📊 투찰전략 분석","🔧 배포자 관리"])
-    target_hit=st.selectbox(
-        "개선 추천구간 목표 적중률",
-        [60,70,80],
-        index=1,
-        format_func=lambda x: f"{x}%형"
-    )
-    st.caption("목표 적중률이 높을수록 추천 사정율 하한/상한 폭이 넓어집니다.")
     st.divider()
     df_hist=load_history(); pattern_stats=load_pattern_stats()
     if df_hist is not None:
@@ -1048,42 +1121,24 @@ if mode=="🔧 배포자 관리":
     ADMIN_PWD=st.secrets.get("ADMIN_PWD","admin1234")
     if pwd!=ADMIN_PWD: st.info("비밀번호를 입력하세요."); st.stop()
     st.success("✅ 관리자 인증")
-    tab1,tab2=st.tabs(["📂 낙찰이력 업로드","📊 3포인트 전략 현황"])
-    with tab1:
-        uploaded=st.file_uploader("낙찰이력 xlsx 업로드",type=["xlsx","xls"])
-        if uploaded:
-            with st.spinner("처리 중..."):
-                try:
-                    content=uploaded.read()
-                    df_new=pd.read_excel(io.BytesIO(content))
-                    required=["발주기관","공고명","기초금액","예가/기초(0%)"]
-                    missing=[c for c in required if c not in df_new.columns]
-                    if missing: st.error(f"필수 컬럼 없음: {missing}")
-                    else:
-                        save_history(df_new)
-                        df_v=df_new[df_new["예가/기초(0%)"].notna()&(df_new["예가/기초(0%)"].abs()<10)]
-                        st.success("✅ 업로드 완료!")
-                        c1,c2,c3=st.columns(3)
-                        c1.metric("총 건수",f"{len(df_v):,}건")
-                        c2.metric("발주처 수",f"{df_v['발주기관'].nunique()}개")
-                        c3.metric("평균 사정율",f"{df_v['예가/기초(0%)'].mean():+.4f}%")
-                except Exception as e: st.error(f"오류: {e}")
-    with tab2:
-        st.subheader("3포인트 전략 DB (30,614건 기반)")
-        tp_rows=[]
-        for org,d in THREE_PT.items():
-            bias_icon="🔵" if "음수" in d['bias'] else "🔴" if "양수" in d['bias'] else "⚪"
-            tp_rows.append({
-                "발주처":org.replace("한국전력공사 ","한전 "),
-                "편향":f"{bias_icon}{d['bias']}",
-                "편향상세":d['detail'],
-                "업체A":f"{d['pt_a']:+.2f}%",
-                "업체C":f"{d['pt_c']:+.2f}%",
-                "전체커버":f"{d['cover']}%",
-                "최근커버":f"{d['cover_r']}%" if d['cover_r']>0 else "-",
-                "비고":d['note']
-            })
-        st.dataframe(pd.DataFrame(tp_rows),use_container_width=True,hide_index=True)
+    uploaded=st.file_uploader("낙찰이력 xlsx 업로드",type=["xlsx","xls"])
+    if uploaded:
+        with st.spinner("처리 중..."):
+            try:
+                content=uploaded.read()
+                df_new=pd.read_excel(io.BytesIO(content))
+                required=["발주기관","공고명","기초금액","예가/기초(0%)"]
+                missing=[c for c in required if c not in df_new.columns]
+                if missing: st.error(f"필수 컬럼 없음: {missing}")
+                else:
+                    save_history(df_new)
+                    df_v=df_new[df_new["예가/기초(0%)"].notna()&(df_new["예가/기초(0%)"].abs()<10)]
+                    st.success("✅ 업로드 완료!")
+                    c1,c2,c3=st.columns(3)
+                    c1.metric("총 건수",f"{len(df_v):,}건")
+                    c2.metric("발주처 수",f"{df_v['발주기관'].nunique()}개")
+                    c3.metric("평균 사정율",f"{df_v['예가/기초(0%)'].mean():+.4f}%")
+            except Exception as e: st.error(f"오류: {e}")
 
 # ══ 투찰전략 분석 ════════════════════════════════════════════════
 else:
@@ -1101,11 +1156,9 @@ else:
         st.markdown(f"""
         <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:12px;font-size:0.9em">
         <b>📌 분석 방법</b><br>
-        🔵 ①패턴: 발주처 이력 패턴분석<br>
-        🟢 ②유사표본: 유사용역 낙찰이력<br>
-        🟡 ③트렌드: 최근 흐름 분석<br>
-        🟣 <b>개선추천: 백테스트 최적모델 추천값</b><br>
-        🔴 <b>3포인트: A/B/C 분산투찰 전략</b><br><br>
+        1️⃣ <b>업체 1:</b> 관련 이력의 25% 분위수<br>
+        2️⃣ <b>업체 2:</b> 백테스트 최적모델 추천값<br>
+        3️⃣ <b>업체 3:</b> 관련 이력의 75% 분위수<br><br>
         <b>데이터:</b> {nc:,}건 | {no}개 발주처
         </div>""",unsafe_allow_html=True)
 
@@ -1147,157 +1200,63 @@ else:
         a1=analyze_pattern(b["org"],df_c,pattern_stats)
         a2=analyze_similar(b["name"],b["base"],df_c)
         a3=analyze_trend(b["org"],df_c)
-        im=analyze_improved_model(b,df_model,target_hit)
-        lo,hi=recommend_range(a1,a2,a3)
-        conv_std,conv_lbl=convergence_score(a1,a2,a3)
+        im=analyze_improved_model(b,df_model)
+        recommendations=build_company_recommendations(b,im,a1,a2,a3,df_model)
         amt_lbl,amt_adj,amt_note=get_amt_info(b["base_억"])
-        # 3포인트: 한전 + 수의계약 제외
-        pred_val=a1["pred"] if a1 else 0.0
-        tp=get_three_pt(b["org"],pred_val) if is_three_pt_applicable(b["org"],b["name"]) else None
         results.append({"bid":b,"a1":a1,"a2":a2,"a3":a3,
                         "improved":im,
-                        "range_lo":lo,"range_hi":hi,
-                        "conv_std":conv_std,"conv_lbl":conv_lbl,
                         "amt_lbl":amt_lbl,"amt_adj":amt_adj,"amt_note":amt_note,
-                        "three_pt":tp})
+                        "recommendations":recommendations})
         prog.progress((i+1)/len(bids))
     prog.empty()
 
-    # ── 요약 테이블 ──────────────────────────────────────────
-    st.subheader(f"📋 투찰전략 — {datetime.now().strftime('%Y.%m.%d')} ({len(bids)}건)")
+    # ── 요약 테이블: 최종 추천값과 근거만 표시 ───────────────
+    st.subheader(f"📋 3개 업체 추천 사정율 — {datetime.now().strftime('%Y.%m.%d')} ({len(bids)}건)")
     rows=[]
     for row in results:
-        b=row["bid"]; a1=row["a1"]; a2=row["a2"]; a3=row["a3"]
-        lo,hi=row["range_lo"],row["range_hi"]; tp=row["three_pt"]; im=row.get("improved")
-        grade=a1.get("grade","?") if a1 else "?"
-        ge={"A":"🟢","B":"🔵","C":"🟡","D":"🔴"}.get(grade,"⚪")
-        tp_str=f"A:{tp['pt_a']:+.2f} B:{tp['pt_b']:+.4f} C:{tp['pt_c']:+.2f} ({tp['cover']}%)" if tp else "-"
-        lo95_str=f"{tp['lo95']:+.2f}~{tp['hi95']:+.2f}%" if (tp and tp.get('lo95')) else "-"
+        b=row["bid"]; recs=row.get("recommendations") or []
+        vals=[f"{r['rate']:+.4f}%" for r in recs]
+        bases=[r["basis"] for r in recs]
         rows.append({"No":b["no"],
             "공고명":b["name"][:33]+"…" if len(b["name"])>33 else b["name"],
             "발주기관":b["org"].replace("한국전력공사 ","한전 "),
             "기초(억)":f"{b['base_억']:.4f}" if b["base"]>0 else "미정",
             "마감":b["deadline"],
-            "①패턴":f"{a1['pred']:+.4f}%" if a1 else "없음",
-            "②유사표본":f"{a2['pred']:+.4f}%" if a2 else "없음",
-            "③트렌드":f"{a3['pred']:+.4f}%" if a3 else "없음",
-            "개선추천":f"{im['pred']:+.4f}%" if im else "없음",
-            "추천 사정율 하한":f"{im['lo']:+.4f}%" if im else "-",
-            "추천 사정율 상한":f"{im['hi']:+.4f}%" if im else "-",
-            "적용모델":im["model_label"] if im else "-",
-            "기존하한":f"{lo:+.4f}%" if lo is not None else "-",
-            "기존상한":f"{hi:+.4f}%" if hi is not None else "-",
-            "분석값 일치도":row["conv_lbl"],"등급":f"{ge}{grade}",
-            "3포인트":tp_str,
-            "실분포95%":lo95_str})
+            "업체 1 추천":vals[0] if len(vals)>0 else "없음",
+            "업체 1 근거":bases[0] if len(bases)>0 else "데이터 부족",
+            "업체 2 추천":vals[1] if len(vals)>1 else "없음",
+            "업체 2 근거":bases[1] if len(bases)>1 else "데이터 부족",
+            "업체 3 추천":vals[2] if len(vals)>2 else "없음",
+            "업체 3 근거":bases[2] if len(bases)>2 else "데이터 부족"})
     st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True,
                  column_config={"No":st.column_config.NumberColumn(width=50),
                                  "공고명":st.column_config.TextColumn(width=200),
-                                "적용모델":st.column_config.TextColumn(width=180),
-                                 "3포인트":st.column_config.TextColumn(width=220)})
+                                 "업체 1 근거":st.column_config.TextColumn(width=240),
+                                 "업체 2 근거":st.column_config.TextColumn(width=280),
+                                 "업체 3 근거":st.column_config.TextColumn(width=240)})
     st.divider()
 
     # ── 건별 상세 ────────────────────────────────────────────
     st.subheader("📌 건별 상세 + 사정율 흐름 차트")
     for row in results:
-        b=row["bid"]; a1=row["a1"]; a2=row["a2"]; a3=row["a3"]
-        lo,hi=row["range_lo"],row["range_hi"]; tp=row["three_pt"]; im=row.get("improved")
-        rec_lo,rec_hi=(im["lo"],im["hi"]) if im else (lo,hi)
-        grade=a1.get("grade","?") if a1 else "?"
-        ge={"A":"🟢","B":"🔵","C":"🟡","D":"🔴"}.get(grade,"⚪")
+        b=row["bid"]; recs=row.get("recommendations") or []
         label=(f"No.{b['no']}  {b['name'][:48]}  |  "
                f"{b['org'].replace('한국전력공사 ','한전 ')}  |  "
-               f"{b['base_억']:.4f}억  |  {b['deadline']}  {ge}{grade}")
+               f"{b['base_억']:.4f}억  |  {b['deadline']}")
         with st.expander(label):
-            # 신뢰도 + 금액구간 배너
-            col_g,col_a=st.columns([1,2])
-            with col_g:
-                gc={"A":"grade-a","B":"grade-b","C":"grade-c","D":"grade-d"}.get(grade,"grade-c")
-                mae_v=a1.get("mae",0) if a1 else 0
-                st.markdown(f'<span class="{gc}">신뢰도 {grade} (MAE:{mae_v:.3f}%)</span>',unsafe_allow_html=True)
-            with col_a:
-                amt_note=row["amt_note"]; amt_adj=row["amt_adj"]; amt_lbl=row["amt_lbl"]
-                if "유리" in amt_note: st.success(f"💰 {amt_lbl} — 유리한 구간 ({amt_adj:+.4f}%)")
-                elif "보수" in amt_note: st.warning(f"⚠️ {amt_lbl} — 보수적 접근 권장 ({amt_adj:+.4f}%)")
-                else: st.info(f"📐 {amt_lbl} ({amt_adj:+.4f}%)")
-
-            c1,c2,c3,c4,c5=st.columns(5)
-            with c1:
-                v=f"{a1['pred']:+.4f}%" if a1 else "이력없음"
-                st.markdown(f'<div class="val-box val-pattern">①패턴<br>{v}</div>',unsafe_allow_html=True)
-                if a1:
-                    st.caption(f"n={a1['n']}건 | {a1['trend']} | {a1['pattern']}패턴")
-                    st.caption(f"r5={a1['r5']:+.4f} / r10={a1['r10']:+.4f} / 직전:{a1['last_val']:+.4f}%")
-                    if a1.get("std",0) > 0.3:
-                        st.caption(f"⚠️ std={a1['std']:.3f}% — 실제분포 넓음")
-            with c2:
-                v=f"{a2['pred']:+.4f}%" if a2 else "이력없음"
-                fb = a2.get("fallback",False) if a2 else False
-                box_style = "val-similar" if not fb else "val-trend"
-                st.markdown(f'<div class="val-box {box_style}">②유사표본{"(대체)" if fb else ""}<br>{v}</div>',unsafe_allow_html=True)
-                if a2:
-                    if fb:
-                        st.caption(f"⚠️ {a2.get('fallback_note','분야평균 대체')}")
-                    st.caption(f"유사 {a2['n']}건 | 평균:{a2['mean']:+.4f}%")
-                    if a2.get("avg_companies"): st.caption(f"업체수 참고:{a2['avg_companies']}개")
-            with c3:
-                v=f"{a3['pred']:+.4f}%" if a3 else "이력없음"
-                st.markdown(f'<div class="val-box val-trend">③트렌드<br>{v}</div>',unsafe_allow_html=True)
-                if a3:
-                    st.caption(f"최근{a3['recent_n']}건평균:{a3['recent_mean']:+.4f}%")
-                    st.caption(f"drift:{a3['drift']:+.4f}% | 최근3건:{a3['recent3_mean']:+.4f}%")
-            with c4:
-                if im:
-                    st.markdown(f'<div class="val-box val-rec">개선추천<br>{im["pred"]:+.4f}%</div>',unsafe_allow_html=True)
-                    st.caption(f"{im['model_label']} | {im['target_hit']}%형")
-                    st.caption(f"추천 사정율 하한/상한: {im['lo']:+.4f}% ~ {im['hi']:+.4f}%")
-                    st.caption(f"평균오차 {im['mae']:.4f}%p | 근거 {im['basis_n']}건")
-                else:
-                    st.markdown('<div class="val-box" style="background:#fee2e2;color:#991b1b">개선추천<br>데이터부족</div>',unsafe_allow_html=True)
-            with c5:
-                if lo is not None:
-                    st.markdown(f'<div class="val-box val-rec">기존 권장<br>{lo:+.4f}%~{hi:+.4f}%</div>',unsafe_allow_html=True)
-                    if b["base"]>0:
-                        st.caption(f"하한: {int(b['base']*(100+lo)/100):,}원")
-                        st.caption(f"상한: {int(b['base']*(100+hi)/100):,}원")
-                    st.caption(f"분석값 일치도: {row['conv_lbl']}")
-                else:
-                    st.markdown('<div class="val-box" style="background:#fee2e2;color:#991b1b">⚠️ 데이터부족</div>',unsafe_allow_html=True)
-
-            # ── 3포인트 분산투찰 카드 (한전만) ───────────────
-            if tp:
-                st.markdown("---")
-                bias_icon="🔵" if "음수" in tp["bias"] else "🔴" if "양수" in tp["bias"] else "⚪"
-                cover_r_str=f" | 최근커버: **{tp['cover_r']}%**" if tp['cover_r']>0 else ""
-                lo95=tp.get("lo95",0); hi95=tp.get("hi95",0)
-                st.markdown(
-                    f"**🏢 3개 업체 분산투찰 전략** &nbsp;"
-                    f"{bias_icon} 편향: **{tp['bias']}** ({tp['detail']}) &nbsp;|&nbsp; "
-                    f"커버율: **{tp['cover']}%**{cover_r_str}",
-                    unsafe_allow_html=False
-                )
-                # ── 복수예가 분포 안내 ──────────────────────────
-                if lo95 and hi95:
-                    st.info(
-                        f"📊 **복수예가 실제 분포 안내** — "
-                        f"실제 낙찰은 **{lo95:+.2f}% ~ {hi95:+.2f}%** 전 구간에 균등 분포합니다 (95% 범위). "
-                        f"①②③ 예측값은 중앙경향성(평균 근처)이며, "
-                        f"업체A·C는 실제 분포의 **하위25%({tp['pt_a']:+.2f}%)·상위75%({tp['pt_c']:+.2f}%)** 구간을 커버합니다."
-                    )
-                ca,cb,cc=st.columns(3)
-                with ca:
-                    amt_a=f"\n{int(b['base']*(100+tp['pt_a'])/100):,}원" if b['base']>0 else ""
-                    st.markdown(f'<div class="val-a">🏢 업체A<br>{tp["pt_a"]:+.2f}%{amt_a}</div>',unsafe_allow_html=True)
-                    st.caption(f"▶ 하위25% 분위수 | {'음수주력' if '음수' in tp['bias'] else '음수헷지'}")
-                    if b['base']>0: st.caption(f"※ 수익성 검토 필요")
-                with cb:
-                    amt_b=f"\n{int(b['base']*(100+tp['pt_b'])/100):,}원" if b['base']>0 else ""
-                    st.markdown(f'<div class="val-b">🏢 업체B (차트예측)<br>{tp["pt_b"]:+.4f}%{amt_b}</div>',unsafe_allow_html=True)
-                    st.caption("▶ 중앙경향성 예측값 (핵심 포인트)")
-                with cc:
-                    amt_c=f"\n{int(b['base']*(100+tp['pt_c'])/100):,}원" if b['base']>0 else ""
-                    st.markdown(f'<div class="val-c">🏢 업체C<br>{tp["pt_c"]:+.2f}%{amt_c}</div>',unsafe_allow_html=True)
-                    st.caption(f"▶ 상위75% 분위수 | {'양수주력' if '양수' in tp['bias'] else '양수헷지'}")
+            if recs:
+                cols=st.columns(3)
+                styles=["val-a","val-b","val-c"]
+                for col,rec,style in zip(cols,recs,styles):
+                    with col:
+                        amount=f"<br>{int(b['base']*(100+rec['rate'])/100):,}원" if b['base']>0 else ""
+                        st.markdown(
+                            f'<div class="{style}">🏢 {rec["company"]}<br>{rec["rate"]:+.4f}%{amount}</div>',
+                            unsafe_allow_html=True
+                        )
+                        st.caption(f"산정 근거: {rec['basis']}")
+            else:
+                st.warning("추천값을 계산할 낙찰이력이 부족합니다.")
 
             # ── 사정율 흐름 차트: 발주처 전체 vs 해당분야 ───────
             st.markdown("---")
@@ -1326,9 +1285,9 @@ else:
 
     st.divider()
     st.subheader("💾 전략표 다운로드")
-    excel_buf=make_excel(results)
+    excel_buf=make_excel_simple(results)
     today_str=datetime.now().strftime("%Y%m%d")
-    st.download_button("📥 엑셀 다운로드 (v2.1 — 3포인트 전략 포함)",
+    st.download_button("📥 3개 업체 추천표 다운로드",
         data=excel_buf,
         file_name=f"투찰전략_{today_str}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
