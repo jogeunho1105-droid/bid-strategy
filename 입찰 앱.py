@@ -1,5 +1,5 @@
 # ╔══════════════════════════════════════════════════════════════════╗
-# ║  투찰전략 분석 시스템 v2.11                                     ║
+# ║  투찰전략 분석 시스템 v2.12                                     ║
 # ║  개선: 백테스트 기반 3개 업체 추천 사정율                       ║
 # ║  - 비한전/조달청: 3포인트 미적용, 단일전략 표시                 ║
 # ║  - ③트렌드 최소값 보정 (±0.02% 미만 시 보정)                  ║
@@ -558,8 +558,8 @@ def pattern_at(values,idx):
         "trend":trend_label(values[start:idx+1]),
     }
 
-def company3_line_recommendation(org_df, rate, fallback, step=0.02):
-    """발주처 전체에서 같은 직전패턴 뒤 결과를 0.02 라인으로 집계한다."""
+def company3_line_recommendation(org_df, rate, fallback, step=0.0005):
+    """발주처 전체에서 같은 직전패턴 뒤 결과를 0.0005 라인으로 집계한다."""
     vals=history_sorted(org_df)[rate].astype(float).tolist()
     if len(vals)<6:
         return round(float(fallback),4), "해당 발주처 이력이 6건 미만이어서 업체2 중심값 적용"
@@ -587,9 +587,9 @@ def company3_line_recommendation(org_df, rate, fallback, step=0.02):
     selected_key=min(top_keys,key=lambda k:abs(k*step-target))
     selected_line=round(selected_key*step,4)
     basis=(
-        f"발주처 전체 {len(vals)}건을 {step:.2f}%p 라인으로 집계; "
+        f"발주처 전체 {len(vals)}건을 {step:.4f}%p 라인으로 집계; "
         f"직전패턴 {current['movement']}·{current['sign']}·{current['trend']}추세, "
-        f"{match_label} {len(next_values)}건 중 {selected_line:+.2f}% 라인 {max_count}건으로 최다"
+        f"{match_label} {len(next_values)}건 중 {selected_line:+.4f}% 라인 {max_count}건으로 최다"
     )
     return selected_line,basis
 
@@ -1210,7 +1210,7 @@ def make_excel_simple(results):
 # ════════════════════════════════════════════════════════════════
 st.markdown("""
 <div class="main-header">
-<h2>📊 투찰전략 분석 시스템 v2.11</h2>
+<h2>📊 투찰전략 분석 시스템 v2.12</h2>
 <p style="margin:0;opacity:0.8">3개 업체 추천 사정율과 산정 근거</p>
 </div>""", unsafe_allow_html=True)
 
@@ -1274,7 +1274,7 @@ else:
         <b>📌 분석 방법</b><br>
         1️⃣ <b>업체 1:</b> 발주처 전체·관련분야 부호패턴 + 직전 2건 차이<br>
         2️⃣ <b>업체 2:</b> 백테스트 최적모델 추천값<br>
-        3️⃣ <b>업체 3:</b> 발주처 전체 0.02 라인 + 직전 패턴 최다빈도<br><br>
+        3️⃣ <b>업체 3:</b> 발주처 전체 0.0005 라인 + 직전 패턴 최다빈도<br><br>
         <b>데이터:</b> {nc:,}건 | {no}개 발주처
         </div>""",unsafe_allow_html=True)
 
