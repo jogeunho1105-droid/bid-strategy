@@ -1,5 +1,5 @@
 # ╔══════════════════════════════════════════════════════════════════╗
-# ║  투찰전략 분석 시스템 v2.8                                      ║
+# ║  투찰전략 분석 시스템 v2.9                                      ║
 # ║  개선: 백테스트 기반 3개 업체 추천 사정율                       ║
 # ║  - 비한전/조달청: 3포인트 미적용, 단일전략 표시                 ║
 # ║  - ③트렌드 최소값 보정 (±0.02% 미만 시 보정)                  ║
@@ -777,19 +777,19 @@ def make_simple_flow_chart(df_c, bid, max_n=20):
     fig,axes=plt.subplots(2,1,figsize=(12,5.8),facecolor="#ffffff",sharex=False)
     fig.suptitle(
         f"Adjustment Rate Trend - Agency vs {data['service_chart_label']}",
-        fontsize=11,fontweight="bold",color="#1f2937",y=0.98
+        fontsize=9,fontweight="bold",color="#1f2937",y=0.97
     )
 
     def draw(ax,vals,label,color,marker):
         ax.set_facecolor("#ffffff")
         ax.axhline(0,color="#94a3b8",lw=1.0,alpha=0.9)
-        ax.set_title(label,fontsize=9.5,fontweight="bold",color=color,loc="left",pad=5)
+        ax.set_title(label,fontsize=8,fontweight="bold",color=color,loc="left",pad=4)
         ax.grid(axis="y",alpha=0.22,ls="--")
-        ax.tick_params(labelsize=8)
-        ax.set_ylabel("Rate (%)",fontsize=8.5)
+        ax.tick_params(labelsize=7)
+        ax.set_ylabel("Rate (%)",fontsize=7)
         if not vals:
             ax.text(0.5,0.5,"No data",transform=ax.transAxes,ha="center",va="center",
-                    fontsize=9,color="#64748b")
+                    fontsize=7,color="#64748b")
             return
         x=np.arange(1,len(vals)+1)
         ax.plot(x,vals,color=color,lw=1.9,marker=marker,ms=4.5)
@@ -803,15 +803,15 @@ def make_simple_flow_chart(df_c, bid, max_n=20):
             va="bottom" if yi>=0 else "top"
             ax.annotate(f"{yi:+.4f}\n({delta_txt})",xy=(xi,yi),xytext=(0,yoff),
                         textcoords="offset points",ha="center",va=va,
-                        fontsize=6.5,color=color,fontweight="bold")
+                        fontsize=5.5,color=color,fontweight="bold")
         ax.margins(x=0.03,y=0.34)
 
     draw(axes[0],data["org_vals"],f"{data['org_chart_label']} (n={len(data['org_vals'])})","#2563eb","o")
     draw(axes[1],data["svc_vals"],f"{data['svc_chart_label']} (n={len(data['svc_vals'])})","#16a34a","s")
-    axes[1].set_xlabel("Recent result order",fontsize=8.5)
-    plt.tight_layout(rect=[0,0,1,0.95])
+    axes[1].set_xlabel("Recent result order",fontsize=7)
+    fig.subplots_adjust(left=0.07,right=0.985,bottom=0.09,top=0.90,hspace=0.38)
     buf=io.BytesIO()
-    plt.savefig(buf,format="png",dpi=140,bbox_inches="tight",facecolor="#ffffff")
+    plt.savefig(buf,format="png",dpi=140,facecolor="#ffffff")
     buf.seek(0); plt.close()
     return buf, data
 
@@ -1049,10 +1049,8 @@ def make_excel_simple(results):
     thin=Side(style="thin",color="FFd1d5db")
     border=Border(left=thin,right=thin,top=thin,bottom=thin)
     headers=["No","공고번호","공고명","발주기관","기초금액(억)","마감",
-             "업체 1 추천(%)","업체 1 산정 근거",
-             "업체 2 추천(%)","업체 2 산정 근거",
-             "업체 3 추천(%)","업체 3 산정 근거"]
-    widths=[6,18,44,22,14,14,15,34,15,42,15,34]
+             "업체1추천","업체2추천","업체3추천","비고"]
+    widths=[6,18,44,22,14,14,15,15,15,68]
     ws.merge_cells(start_row=1,start_column=1,end_row=1,end_column=len(headers))
     title=ws.cell(1,1,f"3개 업체 추천 사정율 — {datetime.now().strftime('%Y.%m.%d')}")
     title.font=Font(name="맑은 고딕",bold=True,size=14,color="FFFFFFFF")
@@ -1070,22 +1068,24 @@ def make_excel_simple(results):
         bid=row["bid"]; recs=row.get("recommendations") or []
         base=[bid["no"],bid.get("bid_no",""),bid["name"],bid["org"],
               bid["base_억"] if bid["base"]>0 else "미정",bid["deadline"]]
-        values=list(base)
-        for pos in range(3):
-            rec=recs[pos] if pos<len(recs) else None
-            values.extend([rec["rate"] if rec else "-",rec["basis"] if rec else "데이터 부족"])
+        rates=[recs[pos]["rate"] if pos<len(recs) else "-" for pos in range(3)]
+        notes=[
+            f"업체{pos+1}: {recs[pos]['basis'] if pos<len(recs) else '데이터 부족'}"
+            for pos in range(3)
+        ]
+        values=base+rates+["\n".join(notes)]
         for col,value in enumerate(values,1):
             cell=ws.cell(idx,col,value)
-            cell.font=Font(name="맑은 고딕",size=9,bold=col in (7,9,11))
-            cell.alignment=Alignment(horizontal="right" if col in (5,7,9,11) else "left",
+            cell.font=Font(name="맑은 고딕",size=9,bold=col in (7,8,9))
+            cell.alignment=Alignment(horizontal="right" if col in (5,7,8,9) else "left",
                                      vertical="center",wrap_text=True)
             cell.border=border
-            if col in (7,8): cell.fill=PatternFill("solid",start_color=fills[0])
-            if col in (9,10): cell.fill=PatternFill("solid",start_color=fills[1])
-            if col in (11,12): cell.fill=PatternFill("solid",start_color=fills[2])
-            if col in (7,9,11) and isinstance(value,(int,float)):
+            if col==7: cell.fill=PatternFill("solid",start_color=fills[0])
+            if col==8: cell.fill=PatternFill("solid",start_color=fills[1])
+            if col==9: cell.fill=PatternFill("solid",start_color=fills[2])
+            if col in (7,8,9) and isinstance(value,(int,float)):
                 cell.number_format="+0.0000;-0.0000"
-        ws.row_dimensions[idx].height=36
+        ws.row_dimensions[idx].height=52
     ws.freeze_panes="A3"
     buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf
 
@@ -1094,7 +1094,7 @@ def make_excel_simple(results):
 # ════════════════════════════════════════════════════════════════
 st.markdown("""
 <div class="main-header">
-<h2>📊 투찰전략 분석 시스템 v2.8</h2>
+<h2>📊 투찰전략 분석 시스템 v2.9</h2>
 <p style="margin:0;opacity:0.8">3개 업체 추천 사정율과 산정 근거</p>
 </div>""", unsafe_allow_html=True)
 
@@ -1217,23 +1217,23 @@ else:
         b=row["bid"]; recs=row.get("recommendations") or []
         vals=[f"{r['rate']:+.4f}%" for r in recs]
         bases=[r["basis"] for r in recs]
-        rows.append({"No":b["no"],
-            "공고명":b["name"][:33]+"…" if len(b["name"])>33 else b["name"],
-            "발주기관":b["org"].replace("한국전력공사 ","한전 "),
-            "기초(억)":f"{b['base_억']:.4f}" if b["base"]>0 else "미정",
-            "마감":b["deadline"],
-            "업체 1 추천":vals[0] if len(vals)>0 else "없음",
-            "업체 1 근거":bases[0] if len(bases)>0 else "데이터 부족",
-            "업체 2 추천":vals[1] if len(vals)>1 else "없음",
-            "업체 2 근거":bases[1] if len(bases)>1 else "데이터 부족",
-            "업체 3 추천":vals[2] if len(vals)>2 else "없음",
-            "업체 3 근거":bases[2] if len(bases)>2 else "데이터 부족"})
+        notes=[f"업체{i+1}: {bases[i] if i<len(bases) else '데이터 부족'}" for i in range(3)]
+        rows.append({
+            "공고명":b["name"][:40]+"…" if len(b["name"])>40 else b["name"],
+            "업체1추천":vals[0] if len(vals)>0 else "없음",
+            "업체2추천":vals[1] if len(vals)>1 else "없음",
+            "업체3추천":vals[2] if len(vals)>2 else "없음",
+            "비고":"\n".join(notes)
+        })
     st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True,
-                 column_config={"No":st.column_config.NumberColumn(width=50),
-                                 "공고명":st.column_config.TextColumn(width=200),
-                                 "업체 1 근거":st.column_config.TextColumn(width=240),
-                                 "업체 2 근거":st.column_config.TextColumn(width=280),
-                                 "업체 3 근거":st.column_config.TextColumn(width=240)})
+                 row_height=92,
+                 column_config={
+                     "공고명":st.column_config.TextColumn(width=260),
+                     "업체1추천":st.column_config.TextColumn(width=105),
+                     "업체2추천":st.column_config.TextColumn(width=105),
+                     "업체3추천":st.column_config.TextColumn(width=105),
+                     "비고":st.column_config.TextColumn(width=430)
+                 })
     st.divider()
 
     # ── 건별 상세 ────────────────────────────────────────────
