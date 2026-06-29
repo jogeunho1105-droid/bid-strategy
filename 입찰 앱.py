@@ -1,5 +1,5 @@
 # ╔══════════════════════════════════════════════════════════════════╗
-# ║  투찰전략 분석 시스템 v2.9                                      ║
+# ║  투찰전략 분석 시스템 v2.10                                     ║
 # ║  개선: 백테스트 기반 3개 업체 추천 사정율                       ║
 # ║  - 비한전/조달청: 3포인트 미적용, 단일전략 표시                 ║
 # ║  - ③트렌드 최소값 보정 (±0.02% 미만 시 보정)                  ║
@@ -482,8 +482,63 @@ def analyze_improved_model(bid, df_c):
         "candidates":{k:round(float(v),4) for k,v in candidates.items() if v is not None},
     }
 
+def sign_transition_probability(df, rate):
+    """현재 부호 다음에 양수가 나온 비율을 최근 이력의 부호 전이로 계산한다."""
+    ordered=history_sorted(df).tail(100)
+    vals=ordered[rate].astype(float).tolist()
+    if len(vals)<3:
+        return None
+    current_positive=vals[-1]>=0
+    next_signs=[
+        vals[i+1]>=0 for i in range(len(vals)-1)
+        if (vals[i]>=0)==current_positive
+    ]
+    if len(next_signs)<3:
+        next_signs=[v>=0 for v in vals[1:]]
+    if not next_signs:
+        return None
+    return {"p_positive":float(np.mean(next_signs)), "n":len(next_signs)}
+
+def company1_pattern_recommendation(org_df, service_df, rate, fallback):
+    """전체·분야 부호패턴으로 방향을 정하고 직전 2건 차이를 적용한다."""
+    org_stats=sign_transition_probability(org_df,rate)
+    svc_stats=sign_transition_probability(service_df,rate)
+    stats=[s for s in (org_stats,svc_stats) if s]
+    step_df=service_df if len(service_df)>=2 else org_df
+    step_vals=history_sorted(step_df).tail(2)[rate].astype(float).tolist()
+    if not stats or len(step_vals)<2:
+        return round(float(fallback),4), "해당 발주처의 부호패턴 또는 직전 2건 이력이 부족하여 업체2 중심값 적용"
+
+    p_positive=float(np.mean([s["p_positive"] for s in stats]))
+    predicted_positive=p_positive>=0.5
+    previous,last=step_vals[-2],step_vals[-1]
+    gap=abs(last-previous)
+    candidate=last+gap if predicted_positive else last-gap
+    corrected=False
+    if predicted_positive and candidate<=0:
+        candidate=gap if gap>0 else abs(last)
+        corrected=True
+    elif not predicted_positive and candidate>=0:
+        candidate=-gap if gap>0 else -abs(last)
+        corrected=True
+
+    def prob_text(label,stat):
+        if not stat: return f"{label} 표본부족"
+        pos=stat["p_positive"]*100
+        return f"{label} 양수 {pos:.1f}%/음수 {100-pos:.1f}%(전이 {stat['n']}건)"
+
+    direction="양수" if predicted_positive else "음수"
+    operator="+" if predicted_positive else "-"
+    source="동일분야" if len(service_df)>=2 else "발주처전체"
+    correction="; 부호가 반대여서 예측 부호로 보정" if corrected else ""
+    basis=(
+        f"{prob_text('전체',org_stats)}, {prob_text('관련분야',svc_stats)} → 다음 {direction}; "
+        f"{source} 직전2건 {previous:+.4f}%/{last:+.4f}%, 차이 {gap:.4f}%p를 최신값에 {operator} 적용{correction}"
+    )
+    return round(float(candidate),4),basis
+
 def build_company_recommendations(bid, improved, a1, a2, a3, df_c):
-    """관련 이력의 25/75% 분위수와 백테스트 중심값으로 3개 업체 값을 만든다."""
+    """업체1 부호패턴, 업체2 백테스트 중심값, 업체3 75% 분위수로 추천한다."""
     if df_c is None or len(df_c)==0:
         return None
     df_e=df_c if "_service" in df_c.columns else enrich_history(df_c)
@@ -491,6 +546,8 @@ def build_company_recommendations(bid, improved, a1, a2, a3, df_c):
     svc=classify_service(bid.get("name",""))
     org=str(bid.get("org",""))
     valid=df_e[df_e[rate].notna() & (df_e[rate].abs()<10)].copy()
+    org_df=valid[valid["발주기관"].astype(str)==org]
+    service_df=org_df[org_df["_service"]==svc]
     pools=[
         ("동일 발주처·동일 분야", valid[(valid["발주기관"].astype(str)==org) & (valid["_service"]==svc)]),
         ("동일 발주처", valid[valid["발주기관"].astype(str)==org]),
@@ -501,7 +558,6 @@ def build_company_recommendations(bid, improved, a1, a2, a3, df_c):
     if len(pool)==0:
         return None
     recent=history_sorted(pool).tail(100)
-    q25=float(recent[rate].quantile(.25))
     q75=float(recent[rate].quantile(.75))
     fallback=[x["pred"] for x in (a1,a2,a3) if x]
     center=float(improved["pred"]) if improved else float(np.mean(fallback)) if fallback else float(recent[rate].median())
@@ -509,9 +565,12 @@ def build_company_recommendations(bid, improved, a1, a2, a3, df_c):
         f"{improved['service_label']} 분류, {improved['model_label']} 적용, 근거 {improved['basis_n']}건"
         if improved else f"①패턴·②유사표본·③트렌드의 사용 가능한 분석값 평균"
     )
+    company1,company1_basis=company1_pattern_recommendation(
+        org_df,service_df,rate,center
+    )
     n=len(recent)
     return [
-        {"company":"업체 1", "rate":round(q25,4), "basis":f"{pool_label} 최근 {n}건의 25% 분위수"},
+        {"company":"업체 1", "rate":company1, "basis":company1_basis},
         {"company":"업체 2", "rate":round(center,4), "basis":center_basis},
         {"company":"업체 3", "rate":round(q75,4), "basis":f"{pool_label} 최근 {n}건의 75% 분위수"},
     ]
@@ -1094,7 +1153,7 @@ def make_excel_simple(results):
 # ════════════════════════════════════════════════════════════════
 st.markdown("""
 <div class="main-header">
-<h2>📊 투찰전략 분석 시스템 v2.9</h2>
+<h2>📊 투찰전략 분석 시스템 v2.10</h2>
 <p style="margin:0;opacity:0.8">3개 업체 추천 사정율과 산정 근거</p>
 </div>""", unsafe_allow_html=True)
 
@@ -1156,7 +1215,7 @@ else:
         st.markdown(f"""
         <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:12px;font-size:0.9em">
         <b>📌 분석 방법</b><br>
-        1️⃣ <b>업체 1:</b> 관련 이력의 25% 분위수<br>
+        1️⃣ <b>업체 1:</b> 발주처 전체·관련분야 부호패턴 + 직전 2건 차이<br>
         2️⃣ <b>업체 2:</b> 백테스트 최적모델 추천값<br>
         3️⃣ <b>업체 3:</b> 관련 이력의 75% 분위수<br><br>
         <b>데이터:</b> {nc:,}건 | {no}개 발주처
