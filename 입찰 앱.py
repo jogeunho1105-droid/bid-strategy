@@ -1,5 +1,5 @@
 # ╔══════════════════════════════════════════════════════════════════╗
-# ║  투찰전략 분석 시스템 v2.10                                     ║
+# ║  투찰전략 분석 시스템 v2.11                                     ║
 # ║  개선: 백테스트 기반 3개 업체 추천 사정율                       ║
 # ║  - 비한전/조달청: 3포인트 미적용, 단일전략 표시                 ║
 # ║  - ③트렌드 최소값 보정 (±0.02% 미만 시 보정)                  ║
@@ -537,8 +537,64 @@ def company1_pattern_recommendation(org_df, service_df, rate, fallback):
     )
     return round(float(candidate),4),basis
 
+def movement_label(delta):
+    if delta>0.0001: return "상승"
+    if delta<-0.0001: return "하락"
+    return "보합"
+
+def trend_label(values):
+    sample=np.asarray(values[-5:],dtype=float)
+    if len(sample)<2: return "보합"
+    slope=float(np.polyfit(np.arange(len(sample)),sample,1)[0])
+    if slope>0.005: return "상승"
+    if slope<-0.005: return "하락"
+    return "보합"
+
+def pattern_at(values,idx):
+    start=max(0,idx-4)
+    return {
+        "movement":movement_label(values[idx]-values[idx-1]),
+        "sign":"양수" if values[idx]>=0 else "음수",
+        "trend":trend_label(values[start:idx+1]),
+    }
+
+def company3_line_recommendation(org_df, rate, fallback, step=0.02):
+    """발주처 전체에서 같은 직전패턴 뒤 결과를 0.02 라인으로 집계한다."""
+    vals=history_sorted(org_df)[rate].astype(float).tolist()
+    if len(vals)<6:
+        return round(float(fallback),4), "해당 발주처 이력이 6건 미만이어서 업체2 중심값 적용"
+
+    current=pattern_at(vals,len(vals)-1)
+    profiles=[(i,pattern_at(vals,i)) for i in range(1,len(vals)-1)]
+    levels=[
+        ("상하·음양·추세 일치",lambda p:p==current),
+        ("상하·음양 일치",lambda p:p["movement"]==current["movement"] and p["sign"]==current["sign"]),
+        ("음양 일치",lambda p:p["sign"]==current["sign"]),
+        ("전체 패턴",lambda p:True),
+    ]
+    match_label="전체 패턴"; next_values=[]
+    for label,matcher in levels:
+        selected=[vals[i+1] for i,p in profiles if matcher(p)]
+        if len(selected)>=3 or label=="전체 패턴":
+            match_label=label; next_values=selected; break
+
+    line_keys=[int(round(v/step)) for v in next_values]
+    counts=pd.Series(line_keys).value_counts()
+    max_count=int(counts.max())
+    top_keys=[int(k) for k,v in counts.items() if int(v)==max_count]
+    recent_diff=np.diff(np.asarray(vals[-5:],dtype=float))
+    target=vals[-1]+(float(np.median(recent_diff)) if len(recent_diff) else 0.0)
+    selected_key=min(top_keys,key=lambda k:abs(k*step-target))
+    selected_line=round(selected_key*step,4)
+    basis=(
+        f"발주처 전체 {len(vals)}건을 {step:.2f}%p 라인으로 집계; "
+        f"직전패턴 {current['movement']}·{current['sign']}·{current['trend']}추세, "
+        f"{match_label} {len(next_values)}건 중 {selected_line:+.2f}% 라인 {max_count}건으로 최다"
+    )
+    return selected_line,basis
+
 def build_company_recommendations(bid, improved, a1, a2, a3, df_c):
-    """업체1 부호패턴, 업체2 백테스트 중심값, 업체3 75% 분위수로 추천한다."""
+    """업체1 부호패턴, 업체2 백테스트 중심값, 업체3 0.02 라인패턴으로 추천한다."""
     if df_c is None or len(df_c)==0:
         return None
     df_e=df_c if "_service" in df_c.columns else enrich_history(df_c)
@@ -558,7 +614,6 @@ def build_company_recommendations(bid, improved, a1, a2, a3, df_c):
     if len(pool)==0:
         return None
     recent=history_sorted(pool).tail(100)
-    q75=float(recent[rate].quantile(.75))
     fallback=[x["pred"] for x in (a1,a2,a3) if x]
     center=float(improved["pred"]) if improved else float(np.mean(fallback)) if fallback else float(recent[rate].median())
     center_basis=(
@@ -568,11 +623,13 @@ def build_company_recommendations(bid, improved, a1, a2, a3, df_c):
     company1,company1_basis=company1_pattern_recommendation(
         org_df,service_df,rate,center
     )
-    n=len(recent)
+    company3,company3_basis=company3_line_recommendation(
+        org_df,rate,center
+    )
     return [
         {"company":"업체 1", "rate":company1, "basis":company1_basis},
         {"company":"업체 2", "rate":round(center,4), "basis":center_basis},
-        {"company":"업체 3", "rate":round(q75,4), "basis":f"{pool_label} 최근 {n}건의 75% 분위수"},
+        {"company":"업체 3", "rate":company3, "basis":company3_basis},
     ]
 
 def parse_xls(file_bytes, filename=""):
@@ -1153,7 +1210,7 @@ def make_excel_simple(results):
 # ════════════════════════════════════════════════════════════════
 st.markdown("""
 <div class="main-header">
-<h2>📊 투찰전략 분석 시스템 v2.10</h2>
+<h2>📊 투찰전략 분석 시스템 v2.11</h2>
 <p style="margin:0;opacity:0.8">3개 업체 추천 사정율과 산정 근거</p>
 </div>""", unsafe_allow_html=True)
 
@@ -1217,7 +1274,7 @@ else:
         <b>📌 분석 방법</b><br>
         1️⃣ <b>업체 1:</b> 발주처 전체·관련분야 부호패턴 + 직전 2건 차이<br>
         2️⃣ <b>업체 2:</b> 백테스트 최적모델 추천값<br>
-        3️⃣ <b>업체 3:</b> 관련 이력의 75% 분위수<br><br>
+        3️⃣ <b>업체 3:</b> 발주처 전체 0.02 라인 + 직전 패턴 최다빈도<br><br>
         <b>데이터:</b> {nc:,}건 | {no}개 발주처
         </div>""",unsafe_allow_html=True)
 
