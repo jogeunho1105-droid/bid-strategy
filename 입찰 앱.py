@@ -1,6 +1,6 @@
 # ╔══════════════════════════════════════════════════════════════════╗
-# ║  투찰전략 분석 시스템 v2.12                                     ║
-# ║  개선: 백테스트 기반 3개 업체 추천 사정율                       ║
+# ║  투찰전략 분석 시스템 v2.13                                     ║
+# ║  개선: 2024년 이후 순차 백테스트 기반 3개 업체 추천 사정율     ║
 # ║  - 비한전/조달청: 3포인트 미적용, 단일전략 표시                 ║
 # ║  - ③트렌드 최소값 보정 (±0.02% 미만 시 보정)                  ║
 # ║  - ②유사표본 없을 때 진단/감리 분야 전체평균으로 대체           ║
@@ -306,6 +306,8 @@ SERVICE_CHART_LABELS = {
 }
 
 MODEL_LABELS = {
+    "all_recent20":"전체 최근20건",
+    "service_recent20":"용역성격 최근20건",
     "svc_amount_recent20":"용역성격+금액구간 최근20건",
     "blend_weighted":"가중혼합",
     "service_nearest10_limited":"용역성격 유사패턴 최근10건",
@@ -316,15 +318,15 @@ MODEL_LABELS = {
 }
 
 MODEL_RULES = {
-    "PD": {"model":"svc_amount_recent20", "mae":0.4425, "p70":0.5960},
+    "PD": {"model":"all_recent20", "mae":0.4414, "p70":0.5960},
     "VLF": {"model":"blend_weighted", "mae":0.4038, "p70":0.5447},
-    "concrete": {"model":"service_nearest10_limited", "mae":0.3614, "p70":0.4848},
-    "construction_management": {"model":"org_service_recent20", "mae":0.5376, "p70":0.7028},
-    "design": {"model":"blend_weighted", "mae":0.5174, "p70":0.6654},
-    "diagnosis_other": {"model":"org_service_recent20", "mae":0.5035, "p70":0.6992},
-    "optical": {"model":"blend_mean", "mae":0.4257, "p70":0.5555},
-    "other": {"model":"org_service_nearest5_limited", "mae":0.3870, "p70":0.5000},
-    "supervision": {"model":"org_service_recent20", "mae":0.4516, "p70":0.5842},
+    "concrete": {"model":"blend_mean", "mae":0.3881, "p70":0.4848},
+    "construction_management": {"model":"blend_mean", "mae":0.5586, "p70":0.7028},
+    "design": {"model":"blend_mean", "mae":0.5152, "p70":0.6654},
+    "diagnosis_other": {"model":"org_service_nearest5_limited", "mae":0.4845, "p70":0.6992},
+    "optical": {"model":"blend_weighted", "mae":0.4368, "p70":0.5555},
+    "other": {"model":"blend_mean", "mae":0.4803, "p70":0.5000},
+    "supervision": {"model":"blend_mean", "mae":0.4697, "p70":0.5842},
     "ultrasound": {"model":"org_recent20", "mae":0.5391, "p70":0.7099},
     "_default": {"model":"org_service_recent20", "mae":0.4787, "p70":0.6198},
 }
@@ -531,9 +533,18 @@ def company1_pattern_recommendation(org_df, service_df, rate, fallback):
     operator="+" if predicted_positive else "-"
     source="동일분야" if len(service_df)>=2 else "발주처전체"
     correction="; 부호가 반대여서 예측 부호로 보정" if corrected else ""
+    range_note=""
+    if len(org_df)>=10:
+        lower=float(org_df[rate].quantile(.05))
+        upper=float(org_df[rate].quantile(.95))
+        limited=float(np.clip(candidate,lower,upper))
+        if limited!=candidate:
+            range_note=f"; 발주처 5~95% 범위({lower:+.4f}~{upper:+.4f}%)로 제한"
+        candidate=limited
     basis=(
         f"{prob_text('전체',org_stats)}, {prob_text('관련분야',svc_stats)} → 다음 {direction}; "
-        f"{source} 직전2건 {previous:+.4f}%/{last:+.4f}%, 차이 {gap:.4f}%p를 최신값에 {operator} 적용{correction}"
+        f"{source} 직전2건 {previous:+.4f}%/{last:+.4f}%, 차이 {gap:.4f}%p를 최신값에 {operator} 적용"
+        f"{correction}{range_note}"
     )
     return round(float(candidate),4),basis
 
@@ -558,8 +569,8 @@ def pattern_at(values,idx):
         "trend":trend_label(values[start:idx+1]),
     }
 
-def company3_line_recommendation(org_df, rate, fallback, step=0.0005):
-    """발주처 전체에서 같은 직전패턴 뒤 결과를 0.0005 라인으로 집계한다."""
+def company3_line_recommendation(org_df, rate, fallback, step=0.02):
+    """발주처 전체에서 같은 직전패턴 뒤 결과를 0.02 라인으로 집계한다."""
     vals=history_sorted(org_df)[rate].astype(float).tolist()
     if len(vals)<6:
         return round(float(fallback),4), "해당 발주처 이력이 6건 미만이어서 업체2 중심값 적용"
@@ -1210,7 +1221,7 @@ def make_excel_simple(results):
 # ════════════════════════════════════════════════════════════════
 st.markdown("""
 <div class="main-header">
-<h2>📊 투찰전략 분석 시스템 v2.12</h2>
+<h2>📊 투찰전략 분석 시스템 v2.13</h2>
 <p style="margin:0;opacity:0.8">3개 업체 추천 사정율과 산정 근거</p>
 </div>""", unsafe_allow_html=True)
 
@@ -1274,7 +1285,7 @@ else:
         <b>📌 분석 방법</b><br>
         1️⃣ <b>업체 1:</b> 발주처 전체·관련분야 부호패턴 + 직전 2건 차이<br>
         2️⃣ <b>업체 2:</b> 백테스트 최적모델 추천값<br>
-        3️⃣ <b>업체 3:</b> 발주처 전체 0.0005 라인 + 직전 패턴 최다빈도<br><br>
+        3️⃣ <b>업체 3:</b> 발주처 전체 0.02 라인 + 직전 패턴 최다빈도<br><br>
         <b>데이터:</b> {nc:,}건 | {no}개 발주처
         </div>""",unsafe_allow_html=True)
 
