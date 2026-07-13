@@ -1339,20 +1339,18 @@ else:
     st.success(f"✅ {len(bids)}건 확인")
     results=[]
     df_model=enrich_history(df_c) if df_c is not None else None
-    prog=st.progress(0,"분석 중...")
-    for i,b in enumerate(bids):
-        a1=analyze_pattern(b["org"],df_c,pattern_stats)
-        a2=analyze_similar(b["name"],b["base"],df_c)
-        a3=analyze_trend(b["org"],df_c)
-        im=analyze_improved_model(b,df_model)
-        recommendations=build_company_recommendations(b,im,a1,a2,a3,df_model)
-        amt_lbl,amt_adj,amt_note=get_amt_info(b["base_억"])
-        results.append({"bid":b,"a1":a1,"a2":a2,"a3":a3,
-                        "improved":im,
-                        "amt_lbl":amt_lbl,"amt_adj":amt_adj,"amt_note":amt_note,
-                        "recommendations":recommendations})
-        prog.progress((i+1)/len(bids))
-    prog.empty()
+    with st.spinner(f"분석 중... ({len(bids)}건)"):
+        for b in bids:
+            a1=analyze_pattern(b["org"],df_c,pattern_stats)
+            a2=analyze_similar(b["name"],b["base"],df_c)
+            a3=analyze_trend(b["org"],df_c)
+            im=analyze_improved_model(b,df_model)
+            recommendations=build_company_recommendations(b,im,a1,a2,a3,df_model)
+            amt_lbl,amt_adj,amt_note=get_amt_info(b["base_억"])
+            results.append({"bid":b,"a1":a1,"a2":a2,"a3":a3,
+                            "improved":im,
+                            "amt_lbl":amt_lbl,"amt_adj":amt_adj,"amt_note":amt_note,
+                            "recommendations":recommendations})
 
     # ── 요약 테이블: 최종 추천값과 근거만 표시 ───────────────
     st.subheader(f"📋 3개 업체 추천 사정율 — {datetime.now().strftime('%Y.%m.%d')} ({len(bids)}건)")
