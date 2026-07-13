@@ -484,10 +484,22 @@ def analyze_improved_model(bid, df_c):
         "candidates":{k:round(float(v),4) for k,v in candidates.items() if v is not None},
     }
 
+def rate_values(df, rate, tail=None):
+    """Return clean adjustment-rate values without raising when a filtered pool is empty."""
+    if df is None or len(df)==0 or rate not in getattr(df, "columns", []):
+        return []
+    ordered=history_sorted(df)
+    if ordered is None or len(ordered)==0 or rate not in ordered.columns:
+        return []
+    series=pd.to_numeric(ordered[rate], errors="coerce").dropna()
+    series=series[series.abs()<10]
+    if tail:
+        series=series.tail(tail)
+    return series.astype(float).tolist()
+
 def sign_transition_probability(df, rate):
     """현재 부호 다음에 양수가 나온 비율을 최근 이력의 부호 전이로 계산한다."""
-    ordered=history_sorted(df).tail(100)
-    vals=ordered[rate].astype(float).tolist()
+    vals=rate_values(df, rate, tail=100)
     if len(vals)<3:
         return None
     current_positive=vals[-1]>=0
@@ -507,7 +519,7 @@ def company1_pattern_recommendation(org_df, service_df, rate, fallback):
     svc_stats=sign_transition_probability(service_df,rate)
     stats=[s for s in (org_stats,svc_stats) if s]
     step_df=service_df if len(service_df)>=2 else org_df
-    step_vals=history_sorted(step_df).tail(2)[rate].astype(float).tolist()
+    step_vals=rate_values(step_df, rate, tail=2)
     if not stats or len(step_vals)<2:
         return round(float(fallback),4), "해당 발주처의 부호패턴 또는 직전 2건 이력이 부족하여 업체2 중심값 적용"
 
@@ -534,9 +546,10 @@ def company1_pattern_recommendation(org_df, service_df, rate, fallback):
     source="동일분야" if len(service_df)>=2 else "발주처전체"
     correction="; 부호가 반대여서 예측 부호로 보정" if corrected else ""
     range_note=""
-    if len(org_df)>=10:
-        lower=float(org_df[rate].quantile(.05))
-        upper=float(org_df[rate].quantile(.95))
+    org_vals=rate_values(org_df, rate)
+    if len(org_vals)>=10:
+        lower=float(np.quantile(org_vals,.05))
+        upper=float(np.quantile(org_vals,.95))
         limited=float(np.clip(candidate,lower,upper))
         if limited!=candidate:
             range_note=f"; 발주처 5~95% 범위({lower:+.4f}~{upper:+.4f}%)로 제한"
@@ -571,7 +584,7 @@ def pattern_at(values,idx):
 
 def company3_line_recommendation(org_df, rate, fallback, step=0.02):
     """발주처 전체에서 같은 직전패턴 뒤 결과를 0.02 라인으로 집계한다."""
-    vals=history_sorted(org_df)[rate].astype(float).tolist()
+    vals=rate_values(org_df, rate)
     if len(vals)<6:
         return round(float(fallback),4), "해당 발주처 이력이 6건 미만이어서 업체2 중심값 적용"
 
@@ -610,15 +623,19 @@ def build_company_recommendations(bid, improved, a1, a2, a3, df_c):
         return None
     df_e=df_c if "_service" in df_c.columns else enrich_history(df_c)
     rate="예가/기초(0%)"
+    if rate not in df_e.columns:
+        return None
     svc=classify_service(bid.get("name",""))
     org=str(bid.get("org",""))
-    valid=df_e[df_e[rate].notna() & (df_e[rate].abs()<10)].copy()
-    org_df=valid[valid["발주기관"].astype(str)==org]
-    service_df=org_df[org_df["_service"]==svc]
+    valid=df_e.copy()
+    valid[rate]=pd.to_numeric(valid[rate], errors="coerce")
+    valid=valid[valid[rate].notna() & (valid[rate].abs()<10)].copy()
+    org_df=valid[valid["발주기관"].astype(str)==org] if "발주기관" in valid.columns else valid.iloc[0:0]
+    service_df=org_df[org_df["_service"]==svc] if "_service" in org_df.columns else valid.iloc[0:0]
     pools=[
-        ("동일 발주처·동일 분야", valid[(valid["발주기관"].astype(str)==org) & (valid["_service"]==svc)]),
-        ("동일 발주처", valid[valid["발주기관"].astype(str)==org]),
-        ("동일 분야", valid[valid["_service"]==svc]),
+        ("동일 발주처·동일 분야", service_df),
+        ("동일 발주처", org_df),
+        ("동일 분야", valid[valid["_service"]==svc] if "_service" in valid.columns else valid.iloc[0:0]),
         ("전체 낙찰이력", valid),
     ]
     pool_label,pool=next(((label,data) for label,data in pools if len(data)>=8), pools[-1])
