@@ -1367,15 +1367,13 @@ else:
             "업체3추천":vals[2] if len(vals)>2 else "없음",
             "비고":"\n".join(notes)
         })
-    st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True,
-                 row_height=92,
-                 column_config={
-                     "공고명":st.column_config.TextColumn(width=260),
-                     "업체1추천":st.column_config.TextColumn(width=105),
-                     "업체2추천":st.column_config.TextColumn(width=105),
-                     "업체3추천":st.column_config.TextColumn(width=105),
-                     "비고":st.column_config.TextColumn(width=430)
-                 })
+    summary_df=pd.DataFrame(rows)
+    st.dataframe(
+        summary_df,
+        use_container_width=True,
+        hide_index=True,
+        height=min(760, 38 + 36 * max(len(summary_df), 1)),
+    )
     st.divider()
 
     # ── 건별 상세 ────────────────────────────────────────────
