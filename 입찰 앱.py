@@ -1,6 +1,8 @@
 # ╔══════════════════════════════════════════════════════════════════╗
-# ║  투찰전략 분석 시스템 v2.15.1                                   ║
+# ║  투찰전략 분석 시스템 v2.15.2                                   ║
 # ║  개선: 입찰범위별 이력과 참여조건을 반영한 최대 3개사 추천     ║
+# ║  - 지역제한 1개사 보정 + 최근 90일 변동성 오버레이 반영        ║
+# ║  - 업체1·업체3은 헷지 포인트, 업체2는 중심모델로 명확화       ║
 # ║  - 비한전/조달청: 3포인트 미적용, 단일전략 표시                 ║
 # ║  - ③트렌드 최소값 보정 (±0.02% 미만 시 보정)                  ║
 # ║  - ②유사표본 없을 때 진단/감리 분야 전체평균으로 대체           ║
@@ -677,6 +679,7 @@ def analyze_improved_model(bid, df_c):
     model_used,pred,route_type,org_group=choose_routed_company2(
         bid.get("org",""),svc,model_used,pred,candidates,pools,df_e,rate
     )
+    pred, recent_overlay_note = recent_volatility_overlay(bid, df_e, pred, rate)
     basis_pool=pools.get("발주처+용역성격")
     if basis_pool is None or len(basis_pool)<5:
         basis_pool=pools.get("용역성격")
@@ -688,6 +691,8 @@ def analyze_improved_model(bid, df_c):
         if route_type=="routed"
         else f"{svc_label} 분류 후 백테스트 최적모델({model_label}) 적용"
     )
+    if recent_overlay_note:
+        basis_text += f"; {recent_overlay_note}"
     return {
         "pred":round(float(pred),4),
         "service":svc,
@@ -714,6 +719,92 @@ def rate_values(df, rate, tail=None):
     if tail:
         series=series.tail(tail)
     return series.astype(float).tolist()
+
+
+def recent_window_frame(df, days=90):
+    """최근 N일 이력을 반환한다. 날짜가 없으면 빈 DataFrame을 반환한다."""
+    if df is None or len(df)==0:
+        return pd.DataFrame()
+    d=history_sorted(df).copy()
+    date_col=next((c for c in ["개찰일","입찰일","공고일","마감","투찰마감"] if c in d.columns), None)
+    if not date_col:
+        return pd.DataFrame()
+    d["_bt_dt"]=parse_date_series(d[date_col])
+    d=d[d["_bt_dt"].notna()].copy()
+    if len(d)==0:
+        return pd.DataFrame()
+    latest=d["_bt_dt"].max()
+    return d[d["_bt_dt"]>=latest-pd.Timedelta(days=days)].drop(columns=["_bt_dt"], errors="ignore")
+
+def recent_volatility_overlay(bid, df_e, pred, rate="예가/기초(0%)"):
+    """최근 90일 변동성과 방향성을 중심모델에 약하게 반영한다.
+    백테스트 보완사항: 최근 3개월 변동성이 커진 경우에도 과도하게 따라가지 않도록
+    최근평균 가중치를 낮추고, 최종값은 기존 표본의 5~95% 분위수 범위로 제한한다.
+    """
+    if df_e is None or len(df_e)==0 or rate not in getattr(df_e, "columns", []):
+        return round(float(pred),4), ""
+    org=str(bid.get("org",""))
+    svc=classify_service(bid.get("name",""))
+    base=df_e.copy()
+    if "_service" not in base.columns:
+        base=enrich_history(base)
+    pools=[]
+    if "발주기관" in base.columns and "_service" in base.columns:
+        pools.append(base[(base["발주기관"].astype(str)==org)&(base["_service"]==svc)])
+        pools.append(base[base["발주기관"].astype(str)==org])
+        pools.append(base[base["_service"]==svc])
+    pools.append(base)
+    pool=next((x for x in pools if x is not None and len(x)>=8), base)
+    all_vals=rate_values(pool, rate)
+    recent=recent_window_frame(pool, days=90)
+    recent_vals=rate_values(recent, rate)
+    if len(all_vals)<8 or len(recent_vals)<5:
+        return round(float(pred),4), ""
+    recent_mean=float(np.mean(recent_vals))
+    overall_mean=float(np.mean(all_vals))
+    recent_std=float(np.std(recent_vals))
+    drift=recent_mean-overall_mean
+    # 최근 90일 변동성이 높으면 추세반영을 줄이고, 안정적이면 조금 더 반영한다.
+    weight=0.12 if recent_std>=0.55 else 0.18
+    raw=(1-weight)*float(pred)+weight*recent_mean+0.08*drift
+    adjusted=quantile_clip_value(raw, all_vals)
+    note=(
+        f"최근90일 오버레이 적용(n={len(recent_vals)}, 평균 {recent_mean:+.4f}%, "
+        f"변동성 {recent_std:.4f}, 가중 {weight:.2f})"
+    )
+    return round(float(adjusted),4), note
+
+def apply_single_local_correction(rec, scope_info, df_bid):
+    """경북·대구 등 한전 감리 지역제한 1개사 추천 전용 보정.
+    1개사만 참여하는 경우 분산 효과가 없으므로 업체2 중심값에 최근 3/5/10건
+    지역제한 이력을 일부 반영한다.
+    """
+    if not rec or not scope_info or not scope_info.get("applicable"):
+        return rec
+    if scope_info.get("scope")!="지역제한" or int(scope_info.get("company_count",3))!=1:
+        return rec
+    vals=rate_values(df_bid, "예가/기초(0%)")
+    if len(vals)<8:
+        item=dict(rec)
+        item["basis"]=(item.get("basis","")+"; 1개사 지역제한 보정은 표본 8건 미만으로 미적용").strip("; ")
+        return item
+    r3=float(np.mean(vals[-3:])) if len(vals)>=3 else float(np.mean(vals))
+    r5=float(np.mean(vals[-5:])) if len(vals)>=5 else float(np.mean(vals))
+    r10=float(np.mean(vals[-10:])) if len(vals)>=10 else float(np.mean(vals))
+    recent_center=0.45*r3+0.35*r5+0.20*r10
+    recent_std=float(np.std(vals[-10:])) if len(vals)>=10 else float(np.std(vals))
+    weight=0.25 if recent_std>=0.55 else 0.35
+    raw=(1-weight)*float(rec["rate"])+weight*recent_center
+    adjusted=quantile_clip_value(raw, vals)
+    item=dict(rec)
+    item["rate"]=round(float(adjusted),4)
+    item["basis"]=(
+        f"1개사 지역제한 보정: 업체2 중심값 {float(rec['rate']):+.4f}%에 "
+        f"최근 3/5/10건 가중평균 {recent_center:+.4f}%를 {weight:.0%} 반영"
+        f"(r3 {r3:+.4f}, r5 {r5:+.4f}, r10 {r10:+.4f}, 변동성 {recent_std:.4f}); "
+        f"기존근거: {rec.get('basis','')}"
+    )
+    return item
 
 def sign_transition_probability(df, rate):
     """현재 부호 다음에 양수가 나온 비율을 최근 이력의 부호 전이로 계산한다."""
@@ -863,8 +954,8 @@ def build_company_recommendations(bid, improved, a1, a2, a3, df_c):
     fallback=[x["pred"] for x in (a1,a2,a3) if x]
     center=float(improved["pred"]) if improved else float(np.mean(fallback)) if fallback else float(recent[rate].median())
     center_basis=(
-        f"{improved['basis']}, 근거 {improved['basis_n']}건"
-        if improved else f"①패턴·②유사표본·③트렌드의 사용 가능한 분석값 평균"
+        f"중심모델: {improved['basis']}, 근거 {improved['basis_n']}건"
+        if improved else f"중심모델: ①패턴·②유사표본·③트렌드의 사용 가능한 분석값 평균"
     )
     company1,company1_basis=company1_pattern_recommendation(
         org_df,service_df,rate,center
@@ -873,24 +964,26 @@ def build_company_recommendations(bid, improved, a1, a2, a3, df_c):
         org_df,rate,center
     )
     return [
-        {"company":"업체 1", "rate":company1, "basis":company1_basis},
-        {"company":"업체 2", "rate":round(center,4), "basis":center_basis},
-        {"company":"업체 3", "rate":company3, "basis":company3_basis},
+        {"company":"업체 1", "rate":company1, "role":"방향성 헷지", "basis":"방향성 헷지: "+company1_basis},
+        {"company":"업체 2", "rate":round(center,4), "role":"중심모델", "basis":center_basis},
+        {"company":"업체 3", "rate":company3, "role":"라인 헷지", "basis":"라인 헷지: "+company3_basis},
     ]
 
-def apply_company_count(recommendations, scope_info):
+def apply_company_count(recommendations, scope_info, df_bid=None, bid=None):
     """입찰 참여 가능 업체 수에 맞춰 추천값을 선택하고 업체 번호를 다시 매긴다."""
     recs=list(recommendations or [])
     if not recs:
         return []
     company_count=int((scope_info or {}).get("company_count",3))
     if company_count<=1:
-        # 1개사만 참여할 때는 최근 백테스트 최적모델 중심값을 단독 사용한다.
-        chosen=[recs[1] if len(recs)>1 else recs[0]]
+        # 1개사만 참여할 때는 업체2 중심모델을 사용하되, 한전 지역제한은 최근흐름 보정을 적용한다.
+        base_rec=recs[1] if len(recs)>1 else recs[0]
+        chosen=[apply_single_local_correction(base_rec, scope_info, df_bid)]
     elif company_count==2:
-        # 2개사 참여 시 패턴 추천값과 백테스트 중심값을 사용한다.
+        # 2개사 참여 시 방향성 헷지와 중심모델을 사용한다.
         chosen=recs[:2]
     else:
+        # 3개사 참여 시 방향성 헷지·중심모델·라인 헷지를 모두 사용한다.
         chosen=recs[:3]
     result=[]
     for pos,rec in enumerate(chosen,1):
@@ -1492,7 +1585,7 @@ def make_excel_simple(results):
 # ════════════════════════════════════════════════════════════════
 st.markdown("""
 <div class="main-header">
-<h2>📊 투찰전략 분석 시스템 v2.15.1</h2>
+<h2>📊 투찰전략 분석 시스템 v2.15.2</h2>
 <p style="margin:0;opacity:0.8">입찰 참여조건에 따른 최대 3개 업체 추천 사정율과 산정 근거</p>
 </div>""", unsafe_allow_html=True)
 
@@ -1554,9 +1647,9 @@ else:
         st.markdown(f"""
         <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:12px;font-size:0.9em">
         <b>📌 분석 방법</b><br>
-        1️⃣ <b>업체 1:</b> 발주처 전체·관련분야 부호패턴 + 직전 2건 차이<br>
-        2️⃣ <b>업체 2:</b> 백테스트 최적모델 추천값<br>
-        3️⃣ <b>업체 3:</b> 발주처 전체 0.02 라인 + 직전 패턴 최다빈도<br><br>
+        1️⃣ <b>업체 1:</b> 방향성 헷지 — 부호패턴 + 직전 2건 차이<br>
+        2️⃣ <b>업체 2:</b> 중심모델 — 백테스트 최적모델 + 최근90일 오버레이<br>
+        3️⃣ <b>업체 3:</b> 라인 헷지 — 0.02 라인 + 직전 패턴 최다빈도<br><br>
         <b>참여:</b> 한전 전국 감리 3개사 · 기타 진단·설계 등 3개사<br>
         <b>데이터:</b> {nc:,}건 | {no}개 발주처
         </div>""",unsafe_allow_html=True)
@@ -1606,6 +1699,8 @@ else:
             recommendations=apply_company_count(
                 build_company_recommendations(b,im,a1,a2,a3,df_bid),
                 scope_info,
+                df_bid,
+                b,
             )
             amt_lbl,amt_adj,amt_note=get_amt_info(b["base_억"])
             results.append({"bid":b,"a1":a1,"a2":a2,"a3":a3,
