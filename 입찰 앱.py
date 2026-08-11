@@ -1,8 +1,9 @@
 # ╔══════════════════════════════════════════════════════════════════╗
-# ║  투찰전략 분석 시스템 v2.15.2                                   ║
+# ║  투찰전략 분석 시스템 v2.15.3                                   ║
 # ║  개선: 입찰범위별 이력과 참여조건을 반영한 최대 3개사 추천     ║
 # ║  - 지역제한 1개사 보정 + 최근 90일 변동성 오버레이 반영        ║
 # ║  - 업체1·업체3은 헷지 포인트, 업체2는 중심모델로 명확화       ║
+# ║  - 전기공사 단일참여 1순위 추천모델 추가                       ║
 # ║  - 비한전/조달청: 3포인트 미적용, 단일전략 표시                 ║
 # ║  - ③트렌드 최소값 보정 (±0.02% 미만 시 보정)                  ║
 # ║  - ②유사표본 없을 때 진단/감리 분야 전체평균으로 대체           ║
@@ -302,14 +303,16 @@ SERVICE_LABELS = {
     "PD":"PD", "VLF":"VLF", "optical":"광학", "concrete":"콘크리트",
     "ultrasound":"초음파", "supervision":"감리", "design":"설계",
     "construction_management":"건설사업관리", "diagnosis_other":"진단기타",
-    "other":"기타"
+    "other":"기타",
+    "electric_construction":"전기공사"
 }
 
 SERVICE_CHART_LABELS = {
     "PD":"PD", "VLF":"VLF", "optical":"Optical", "concrete":"Concrete",
     "ultrasound":"Ultrasound", "supervision":"Supervision", "design":"Design",
     "construction_management":"Construction Management",
-    "diagnosis_other":"Diagnosis", "other":"Other"
+    "diagnosis_other":"Diagnosis", "other":"Other",
+    "electric_construction":"Electrical Construction"
 }
 
 MODEL_LABELS = {
@@ -337,6 +340,7 @@ MODEL_RULES = {
     "other": {"model":"blend_mean", "mae":0.4803, "p70":0.5000},
     "supervision": {"model":"blend_mean", "mae":0.4697, "p70":0.5842},
     "ultrasound": {"model":"org_recent20", "mae":0.5391, "p70":0.7099},
+    "electric_construction": {"model":"blend_weighted", "mae":0.4754, "p70":0.7603},
     "_default": {"model":"org_service_recent20", "mae":0.4787, "p70":0.6198},
 }
 
@@ -395,7 +399,7 @@ def year_from_value(value):
 def classify_kepco_scope(bid):
     """현재 입찰의 한전 감리 지역·전국 구분과 참여업체 수를 반환한다."""
     org=str(bid.get("org",""))
-    svc=classify_service(bid.get("name",""))
+    svc=classify_service(bid.get("name",""), bid.get("industry",""))
     if not is_kepco(org) or svc!="supervision":
         return {
             "applicable":False, "scope":"기존분석", "company_count":3,
@@ -442,9 +446,17 @@ def classify_kepco_scope(bid):
         "basis":basis,
     }
 
-def classify_service(name):
+def classify_service(name, industry=None):
     s=str(name or "")
+    ind=str(industry or "")
     su=s.upper()
+    # 전기공사는 감리·설계·진단과 분리한다. 업종이 전기 계열이고 전력감리/전력설계가 아닌 경우 우선 분류한다.
+    is_elec_industry=bool(re.match(r"^전기($|,|\s)", ind))
+    is_service_like=("감리" in s or "설계" in s or "진단" in s or "점검" in s or "측정" in s)
+    if is_elec_industry and "전력감리" not in ind and "전력설계" not in ind and not is_service_like:
+        return "electric_construction"
+    if "전기공사" in s and not is_service_like:
+        return "electric_construction"
     if "VLF" in su: return "VLF"
     if "PD" in su or "부분방전" in s: return "PD"
     if "광학" in s: return "optical"
@@ -455,6 +467,12 @@ def classify_service(name):
     if "설계" in s: return "design"
     if "진단" in s or "점검" in s or "측정" in s: return "diagnosis_other"
     return "other"
+
+def classify_service_row(row):
+    return classify_service(row.get("공고명",""), row.get("업종",""))
+
+def is_electric_construction_bid(bid):
+    return classify_service(bid.get("name",""), bid.get("industry",""))=="electric_construction"
 
 def amount_bucket(base_원):
     try:
@@ -492,7 +510,7 @@ def enrich_history(df):
     d=history_sorted(df)
     if len(d)==0: return d
     d=d.copy()
-    d["_service"]=d["공고명"].apply(classify_service) if "공고명" in d.columns else "other"
+    d["_service"]=d.apply(classify_service_row, axis=1) if "공고명" in d.columns else "other"
     d["_amount_bucket"]=d["기초금액"].apply(amount_bucket) if "기초금액" in d.columns else "금액미상"
     d["_company_bucket"]=d["업체수"].apply(company_bucket) if "업체수" in d.columns else None
     date_col=next((c for c in ["개찰일","입찰일","공고일"] if c in d.columns),None)
@@ -518,6 +536,17 @@ def enrich_history(df):
     )
     return d
 
+def classify_bid_scope(bid):
+    """한전 감리 입찰범위와 전기공사 단일참여 조건을 통합 분류한다."""
+    if is_electric_construction_bid(bid):
+        return {
+            "applicable":True, "scope":"전기공사 단일참여", "company_count":1,
+            "year":year_from_value(bid.get("deadline")), "notice_amount":None,
+            "estimated_price":None,
+            "basis":"전기공사는 감리·설계·진단과 분리하고, 당사 1개사 참여 기준 단일 1순위 추천값 적용",
+        }
+    return classify_kepco_scope(bid)
+
 def history_for_bid(bid, df_c, scope_info=None):
     """한전 감리는 같은 입찰범위만, 그 외 입찰은 기존 전체 이력을 사용한다."""
     if df_c is None or len(df_c)==0:
@@ -526,6 +555,8 @@ def history_for_bid(bid, df_c, scope_info=None):
     if not info["applicable"]:
         return df_c
     d=df_c if "_kepco_scope" in df_c.columns else enrich_history(df_c)
+    if info.get("scope")=="전기공사 단일참여":
+        return d[d["_service"]=="electric_construction"].copy()
     mask=(
         d["발주기관"].astype(str).str.contains("한국전력공사",na=False)
         & (d["_service"]=="supervision")
@@ -595,7 +626,7 @@ def ar1_shrink_prediction(values, center, ridge=10.0):
 def build_model_candidates(bid, df_e):
     if df_e is None or len(df_e)==0: return {}, {}
     org=bid.get("org","")
-    svc=classify_service(bid.get("name",""))
+    svc=classify_service(bid.get("name",""), bid.get("industry",""))
     amt=amount_bucket(bid.get("base",0))
     base=df_e
     pools={
@@ -669,7 +700,7 @@ def choose_routed_company2(org, svc, current_model, current_pred, candidates, po
 
 def analyze_improved_model(bid, df_c):
     if df_c is None or len(df_c)==0: return None
-    svc=classify_service(bid.get("name",""))
+    svc=classify_service(bid.get("name",""), bid.get("industry",""))
     rule=MODEL_RULES.get(svc, MODEL_RULES["_default"])
     df_e=df_c if "_service" in df_c.columns else enrich_history(df_c)
     candidates,pools=build_model_candidates(bid, df_e)
@@ -744,7 +775,7 @@ def recent_volatility_overlay(bid, df_e, pred, rate="예가/기초(0%)"):
     if df_e is None or len(df_e)==0 or rate not in getattr(df_e, "columns", []):
         return round(float(pred),4), ""
     org=str(bid.get("org",""))
-    svc=classify_service(bid.get("name",""))
+    svc=classify_service(bid.get("name",""), bid.get("industry",""))
     base=df_e.copy()
     if "_service" not in base.columns:
         base=enrich_history(base)
@@ -804,6 +835,103 @@ def apply_single_local_correction(rec, scope_info, df_bid):
         f"(r3 {r3:+.4f}, r5 {r5:+.4f}, r10 {r10:+.4f}, 변동성 {recent_std:.4f}); "
         f"기존근거: {rec.get('basis','')}"
     )
+    return item
+
+
+def simple_region(value):
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return "지역미상"
+    parts=[p.strip() for p in re.split(r"[,/\s]+", str(value)) if p.strip()]
+    for p in parts:
+        if p!="전국":
+            return p
+    return "전국"
+
+def robust_rate_center(values):
+    vals=np.asarray([v for v in values if v is not None and np.isfinite(float(v)) and abs(float(v))<10], dtype=float)
+    if len(vals)==0:
+        return None
+    if len(vals)<5:
+        return float(np.mean(vals))
+    lo,hi=np.quantile(vals,[0.10,0.90])
+    trimmed=vals[(vals>=lo)&(vals<=hi)]
+    return float(0.60*np.median(vals)+0.40*np.mean(trimmed))
+
+def electric_construction_single_recommendation(bid, df_bid, base_rate):
+    """전기공사 + 1개사 참여 전용 단일 1순위 추천값.
+    동일 발주기관, 지역, 금액구간, 업체수구간, 최근 1년/90일 흐름을 가중혼합한다.
+    """
+    if df_bid is None or len(df_bid)==0:
+        return round(float(base_rate),4), "전기공사 단일추천: 전기공사 이력 부족으로 중심모델 유지"
+    rate="예가/기초(0%)"
+    d=df_bid.copy()
+    if "_service" not in d.columns:
+        d=enrich_history(d)
+    d=d[d["_service"]=="electric_construction"].copy()
+    if rate not in d.columns or len(d)<20:
+        return round(float(base_rate),4), "전기공사 단일추천: 전기공사 표본 20건 미만으로 중심모델 유지"
+    d[rate]=pd.to_numeric(d[rate], errors="coerce")
+    d=d[d[rate].notna() & (d[rate].abs()<10)].copy()
+    if len(d)<20:
+        return round(float(base_rate),4), "전기공사 단일추천: 유효 전기공사 표본 부족으로 중심모델 유지"
+    d=history_sorted(d)
+    d["_region_simple"]=d["지역"].apply(simple_region) if "지역" in d.columns else "지역미상"
+    d["_amount_bucket"]=d["기초금액"].apply(amount_bucket) if "기초금액" in d.columns else "금액미상"
+    d["_company_bucket"]=d["업체수"].apply(company_bucket) if "업체수" in d.columns else None
+    org=str(bid.get("org",""))
+    region=simple_region(bid.get("region",""))
+    amt=amount_bucket(bid.get("base",0))
+    comp=company_bucket(bid.get("companies", None))
+    items=[]
+    org_pool=d[d["발주기관"].astype(str)==org].tail(30) if "발주기관" in d.columns else d.iloc[0:0]
+    if len(org_pool)>=5:
+        items.append(("동일발주기관", robust_rate_center(org_pool[rate]), 0.35 if len(org_pool)>=10 else 0.25, len(org_pool)))
+    reg_pool=d[d["_region_simple"]==region].tail(50) if region!="지역미상" else d.iloc[0:0]
+    if len(reg_pool)>=8:
+        items.append(("동일지역", robust_rate_center(reg_pool[rate]), 0.20, len(reg_pool)))
+    amt_pool=d[d["_amount_bucket"]==amt].tail(80)
+    if len(amt_pool)>=10:
+        items.append(("금액구간", robust_rate_center(amt_pool[rate]), 0.20, len(amt_pool)))
+    comp_pool=d[d["_company_bucket"]==comp].tail(80)
+    if comp is not None and len(comp_pool)>=10:
+        items.append(("업체수구간", robust_rate_center(comp_pool[rate]), 0.10, len(comp_pool)))
+    date_col=next((c for c in ["개찰일","입찰일","공고일","마감","투찰마감"] if c in d.columns), None)
+    if date_col:
+        tmp=d.copy()
+        tmp["_dt"]=parse_date_series(tmp[date_col])
+        latest=tmp["_dt"].max()
+        recent365=tmp[tmp["_dt"]>=latest-pd.Timedelta(days=365)]
+        if len(recent365)>=20:
+            items.append(("최근1년", robust_rate_center(recent365[rate]), 0.20, len(recent365)))
+        recent90=tmp[tmp["_dt"]>=latest-pd.Timedelta(days=90)]
+        if len(recent90)>=10:
+            std=float(np.std(recent90[rate]))
+            w=0.10 if std>=0.55 else 0.15
+            items.append(("최근90일", robust_rate_center(recent90[rate]), w, len(recent90)))
+    if not items:
+        items.append(("전기공사전체최근", robust_rate_center(d[rate].tail(100)), 1.0, min(len(d),100)))
+    vals=[]; weights=[]; notes=[]
+    for label,val,w,n in items:
+        if val is not None and np.isfinite(float(val)):
+            vals.append(float(val)); weights.append(w); notes.append(f"{label} n={n}")
+    if not vals:
+        return round(float(base_rate),4), "전기공사 단일추천: 산정 후보 부족으로 중심모델 유지"
+    pred=float(np.average(vals, weights=weights))
+    clip_vals=d[rate].tail(300).astype(float).to_numpy()
+    if len(clip_vals)>=20:
+        lo,hi=np.quantile(clip_vals,[0.05,0.95])
+        pred=float(np.clip(pred,lo,hi))
+    note="전기공사 단일 1순위 추천: " + "; ".join(notes[:6])
+    return round(float(pred),4), note
+
+def apply_single_electric_construction_correction(rec, bid, df_bid):
+    if not rec or not is_electric_construction_bid(bid or {}):
+        return rec
+    item=dict(rec)
+    adjusted,note=electric_construction_single_recommendation(bid, df_bid, item.get("rate",0))
+    item["rate"]=adjusted
+    item["role"]="전기공사 단일 1순위"
+    item["basis"]=(note + "; 기준 중심값 " + f"{float(rec.get('rate',0)):+.4f}%")
     return item
 
 def sign_transition_probability(df, rate):
@@ -934,7 +1062,7 @@ def build_company_recommendations(bid, improved, a1, a2, a3, df_c):
     rate="예가/기초(0%)"
     if rate not in df_e.columns:
         return None
-    svc=classify_service(bid.get("name",""))
+    svc=classify_service(bid.get("name",""), bid.get("industry",""))
     org=str(bid.get("org",""))
     valid=df_e.copy()
     valid[rate]=pd.to_numeric(valid[rate], errors="coerce")
@@ -976,9 +1104,13 @@ def apply_company_count(recommendations, scope_info, df_bid=None, bid=None):
         return []
     company_count=int((scope_info or {}).get("company_count",3))
     if company_count<=1:
-        # 1개사만 참여할 때는 업체2 중심모델을 사용하되, 한전 지역제한은 최근흐름 보정을 적용한다.
+        # 1개사만 참여할 때는 업체2 중심모델을 기본으로 사용한다.
+        # 전기공사는 전용 단일 1순위 모델, 한전 지역제한은 지역제한 최근흐름 보정을 적용한다.
         base_rec=recs[1] if len(recs)>1 else recs[0]
-        chosen=[apply_single_local_correction(base_rec, scope_info, df_bid)]
+        if is_electric_construction_bid(bid or {}):
+            chosen=[apply_single_electric_construction_correction(base_rec, bid, df_bid)]
+        else:
+            chosen=[apply_single_local_correction(base_rec, scope_info, df_bid)]
     elif company_count==2:
         # 2개사 참여 시 방향성 헷지와 중심모델을 사용한다.
         chosen=recs[:2]
@@ -1030,6 +1162,8 @@ def parse_xls(file_bytes, filename=""):
                 "deadline": str(row.get("투찰마감") or ""),
                 "org":      str(row.get("발주기관") or ""),
                 "region":   str(row.get("지역") or ""),
+                "industry": str(row.get("업종") or row.get("참가가능업종") or ""),
+                "companies": row.get("업체수") or row.get("참가업체수") or None,
             })
     else:
         # ── xls 형식 (나라장터 기본) ──────────────────────────
@@ -1050,6 +1184,8 @@ def parse_xls(file_bytes, filename=""):
                 "deadline": row.get("투찰마감", ""),
                 "org":      row.get("발주기관", ""),
                 "region":   row.get("지역", ""),
+                "industry": row.get("업종", row.get("참가가능업종", "")),
+                "companies": row.get("업체수", row.get("참가업체수", None)),
             })
     return bids
 
@@ -1222,7 +1358,7 @@ def simple_flow_data(df_c, bid, max_n=20):
     d=df_c if "_service" in df_c.columns else enrich_history(df_c)
     if len(d)==0 or "예가/기초(0%)" not in d.columns: return None
     org=str(bid.get("org",""))
-    svc=classify_service(bid.get("name",""))
+    svc=classify_service(bid.get("name",""), bid.get("industry",""))
     org_df=d[d["발주기관"].astype(str)==org] if "발주기관" in d.columns else d.iloc[0:0]
     svc_df=org_df[org_df["_service"]==svc] if "_service" in org_df.columns else d.iloc[0:0]
     svc_scope="해당 발주처 내 해당분야"
@@ -1585,7 +1721,7 @@ def make_excel_simple(results):
 # ════════════════════════════════════════════════════════════════
 st.markdown("""
 <div class="main-header">
-<h2>📊 투찰전략 분석 시스템 v2.15.2</h2>
+<h2>📊 투찰전략 분석 시스템 v2.15.3</h2>
 <p style="margin:0;opacity:0.8">입찰 참여조건에 따른 최대 3개 업체 추천 사정율과 산정 근거</p>
 </div>""", unsafe_allow_html=True)
 
@@ -1650,7 +1786,7 @@ else:
         1️⃣ <b>업체 1:</b> 방향성 헷지 — 부호패턴 + 직전 2건 차이<br>
         2️⃣ <b>업체 2:</b> 중심모델 — 백테스트 최적모델 + 최근90일 오버레이<br>
         3️⃣ <b>업체 3:</b> 라인 헷지 — 0.02 라인 + 직전 패턴 최다빈도<br><br>
-        <b>참여:</b> 한전 전국 감리 3개사 · 기타 진단·설계 등 3개사<br>
+        <b>참여:</b> 한전 전국 감리 3개사 · 전기공사 1개사 · 기타 진단·설계 등 3개사<br>
         <b>데이터:</b> {nc:,}건 | {no}개 발주처
         </div>""",unsafe_allow_html=True)
 
@@ -1689,7 +1825,7 @@ else:
     df_model=enrich_history(df_c) if df_c is not None else None
     with st.spinner(f"분석 중... ({len(bids)}건)"):
         for b in bids:
-            scope_info=classify_kepco_scope(b)
+            scope_info=classify_bid_scope(b)
             df_bid=history_for_bid(b,df_model,scope_info)
             scoped_pattern_stats={} if scope_info["applicable"] else pattern_stats
             a1=analyze_pattern(b["org"],df_bid,scoped_pattern_stats)
