@@ -1,7 +1,7 @@
 # ╔══════════════════════════════════════════════════════════════════╗
-# ║  투찰전략 분석 시스템 v2.15.3                                   ║
-# ║  개선: 입찰범위별 이력과 참여조건을 반영한 최대 3개사 추천     ║
-# ║  - 지역제한 1개사 보정 + 최근 90일 변동성 오버레이 반영        ║
+# ║  투찰전략 분석 시스템 v2.15.4                                   ║
+# ║  개선: 동일일 안정 정렬 + 최근 90일 오버레이 보수화            ║
+# ║  - 완전 동일 중복 제거 및 데이터 품질 경고                     ║
 # ║  - 업체1·업체3은 헷지 포인트, 업체2는 중심모델로 명확화       ║
 # ║  - 전기공사 단일참여 1순위 추천모델 추가                       ║
 # ║  - 비한전/조달청: 3포인트 미적용, 단일전략 표시                 ║
@@ -51,8 +51,10 @@ st.markdown("""
 
 DATA_DIR     = "data"
 HISTORY_FILE = os.path.join(DATA_DIR, "history.pkl")
+HISTORY_QUALITY_FILE = os.path.join(DATA_DIR, "history_quality.json")
 PATTERN_FILE = os.path.join(DATA_DIR, "pattern_stats.json")
 BUNDLED_PATTERN_FILE = "pattern_stats.json"
+MODEL_VERSION = "v2.15.4"
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # ── 3포인트 전략 DB (분위수 기반, 30,614건 2026-05-13 업데이트) ─
@@ -130,7 +132,7 @@ def get_three_pt(org, pred):
 @st.cache_data
 def load_history():
     if os.path.exists(HISTORY_FILE):
-        return pd.read_pickle(HISTORY_FILE)
+        return prepare_history_frame(pd.read_pickle(HISTORY_FILE))
     return None
 
 @st.cache_data
@@ -144,10 +146,86 @@ def load_pattern_stats():
             return json.load(f)
     return {}
 
+def prepare_history_frame(df):
+    """완전 동일 중복만 제거하고 모든 이력을 재현 가능한 순서로 정렬한다."""
+    if df is None:
+        return None
+    return history_sorted(df.drop_duplicates(keep="first").copy())
+
+def history_quality_summary(df):
+    """업로드 원본을 기준으로 학습 제외·중복·지역 누락 현황을 계산한다."""
+    if df is None:
+        return {}
+    raw=df.copy()
+    row_count=int(len(raw))
+    exact_duplicates=int(raw.duplicated(keep="first").sum())
+    dedup=raw.drop_duplicates(keep="first").copy()
+    if "예가/기초(0%)" in dedup.columns:
+        target=pd.to_numeric(dedup["예가/기초(0%)"], errors="coerce")
+        valid_mask=target.notna() & (target.abs()<10)
+    else:
+        valid_mask=pd.Series(False,index=dedup.index)
+    valid=dedup[valid_mask].copy()
+    invalid_target=int(len(dedup)-len(valid))
+    if "지역" in valid.columns:
+        region_text=valid["지역"].fillna("").astype(str).str.strip()
+        region_missing=region_text.isin(["", "nan", "None", "NaT", "지역미상"])
+    else:
+        region_missing=pd.Series(True,index=valid.index)
+    if len(valid):
+        services=valid.apply(classify_service_row,axis=1)
+        electric_mask=services.eq("electric_construction")
+    else:
+        electric_mask=pd.Series(False,index=valid.index)
+    electric_count=int(electric_mask.sum())
+    electric_region_missing=int((electric_mask & region_missing).sum())
+    return {
+        "source_rows":row_count,
+        "exact_duplicates":exact_duplicates,
+        "stored_rows":int(len(dedup)),
+        "valid_rows":int(len(valid)),
+        "invalid_target_rows":invalid_target,
+        "region_missing_rows":int(region_missing.sum()),
+        "region_missing_rate":float(region_missing.mean()) if len(valid) else 0.0,
+        "electric_rows":electric_count,
+        "electric_region_missing_rows":electric_region_missing,
+        "electric_region_missing_rate":(
+            float(electric_region_missing/electric_count) if electric_count else 0.0
+        ),
+        "model_version":MODEL_VERSION,
+    }
+
+@st.cache_data
+def load_history_quality(df=None):
+    if os.path.exists(HISTORY_QUALITY_FILE):
+        try:
+            with open(HISTORY_QUALITY_FILE,encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return history_quality_summary(df) if df is not None else {}
+
+def history_quality_warning(quality):
+    if not quality:
+        return "데이터 품질 정보 없음"
+    return (
+        f"완전 동일 중복 {int(quality.get('exact_duplicates',0)):,}행 제거; "
+        f"목표값 누락·비정상 {int(quality.get('invalid_target_rows',0)):,}행 제외; "
+        f"지역 누락 {int(quality.get('region_missing_rows',0)):,}행"
+        f"({float(quality.get('region_missing_rate',0)):.1%}); "
+        f"전기공사 지역 누락 {int(quality.get('electric_region_missing_rows',0)):,}/"
+        f"{int(quality.get('electric_rows',0)):,}행"
+        f"({float(quality.get('electric_region_missing_rate',0)):.1%})"
+    )
+
 def save_history(df):
     os.makedirs(DATA_DIR, exist_ok=True)
-    df.to_pickle(HISTORY_FILE)
+    quality=history_quality_summary(df)
+    prepare_history_frame(df).to_pickle(HISTORY_FILE)
+    with open(HISTORY_QUALITY_FILE,"w",encoding="utf-8") as f:
+        json.dump(quality,f,ensure_ascii=False,indent=2)
     st.cache_data.clear()
+    return quality
 
 def save_pattern_stats(stats):
     with open(PATTERN_FILE, "w", encoding="utf-8") as f:
@@ -497,13 +575,23 @@ def company_bucket(v):
 
 def history_sorted(df):
     if df is None or len(df)==0: return pd.DataFrame()
-    d=df.copy()
+    # 완전 동일 중복만 제거한다. 공고번호가 같더라도 재공고·재개찰 행은 유지한다.
+    d=df.drop_duplicates(keep="first").copy()
     for col in ["개찰일", "입찰일", "공고일", "마감", "투찰마감"]:
         if col in d.columns:
             dt=parse_date_series(d[col])
             if dt.notna().sum()>0:
-                d=d.assign(_dt=dt).sort_values("_dt")
-                return d.drop(columns=["_dt"])
+                d=d.assign(_dt=dt)
+                sort_cols=["_dt"]
+                if "공고번호" in d.columns:
+                    d["_sort_notice"]=d["공고번호"].fillna("").astype(str)
+                    sort_cols.append("_sort_notice")
+                if "번호" in d.columns:
+                    d["_sort_no"]=pd.to_numeric(d["번호"],errors="coerce")
+                    sort_cols.append("_sort_no")
+                # mergesort는 동일 키의 기존 순서를 보존해 같은 파일의 반복 실행값을 고정한다.
+                d=d.sort_values(sort_cols,kind="mergesort",na_position="last")
+                return d.drop(columns=["_dt","_sort_notice","_sort_no"],errors="ignore")
     return d.reset_index(drop=True)
 
 def enrich_history(df):
@@ -795,13 +883,32 @@ def recent_volatility_overlay(bid, df_e, pred, rate="예가/기초(0%)"):
     overall_mean=float(np.mean(all_vals))
     recent_std=float(np.std(recent_vals))
     drift=recent_mean-overall_mean
-    # 최근 90일 변동성이 높으면 추세반영을 줄이고, 안정적이면 조금 더 반영한다.
-    weight=0.12 if recent_std>=0.55 else 0.18
-    raw=(1-weight)*float(pred)+weight*recent_mean+0.08*drift
+    scope_info=classify_bid_scope(bid)
+    keep_legacy=(
+        is_electric_construction_bid(bid)
+        or (
+            scope_info.get("scope")=="지역제한"
+            and int(scope_info.get("company_count",3))==1
+        )
+    )
+    # 전기공사 및 한전 지역제한 1개사는 백테스트에서 대안 우위가 확인되지 않아
+    # v2.15.3 오버레이를 유지하고, 그 외에만 v2.15.4 보수 가중치를 적용한다.
+    if keep_legacy:
+        weight=0.12 if recent_std>=0.55 else 0.18
+        drift_weight=0.08
+        policy="v2.15.3 유지"
+    else:
+        weight=0.05 if recent_std>=0.55 else 0.10
+        drift_weight=0.04
+        policy="v2.15.4 보수화"
+    raw=(1-weight)*float(pred)+weight*recent_mean+drift_weight*drift
     adjusted=quantile_clip_value(raw, all_vals)
+    clipped=not np.isclose(float(raw),float(adjusted),rtol=0,atol=1e-12)
     note=(
-        f"최근90일 오버레이 적용(n={len(recent_vals)}, 평균 {recent_mean:+.4f}%, "
-        f"변동성 {recent_std:.4f}, 가중 {weight:.2f})"
+        f"최근90일 오버레이({policy}, 기준표본 n={len(all_vals)}, 최근 n={len(recent_vals)}, "
+        f"평균 {recent_mean:+.4f}%, 변동성 {recent_std:.4f}, 최근가중 {weight:.2f}, "
+        f"drift {drift:+.4f}%p×{drift_weight:.2f}, "
+        f"5~95% 제한 {'적용' if clipped else '미적용'})"
     )
     return round(float(adjusted),4), note
 
@@ -817,6 +924,8 @@ def apply_single_local_correction(rec, scope_info, df_bid):
     vals=rate_values(df_bid, "예가/기초(0%)")
     if len(vals)<8:
         item=dict(rec)
+        item["model_label"]="한전 지역제한 1개사"
+        item["basis_n"]=len(vals)
         item["basis"]=(item.get("basis","")+"; 1개사 지역제한 보정은 표본 8건 미만으로 미적용").strip("; ")
         return item
     r3=float(np.mean(vals[-3:])) if len(vals)>=3 else float(np.mean(vals))
@@ -829,6 +938,9 @@ def apply_single_local_correction(rec, scope_info, df_bid):
     adjusted=quantile_clip_value(raw, vals)
     item=dict(rec)
     item["rate"]=round(float(adjusted),4)
+    item["model"]="kepco_local_single"
+    item["model_label"]="한전 지역제한 1개사"
+    item["basis_n"]=len(vals)
     item["basis"]=(
         f"1개사 지역제한 보정: 업체2 중심값 {float(rec['rate']):+.4f}%에 "
         f"최근 3/5/10건 가중평균 {recent_center:+.4f}%를 {weight:.0%} 반영"
@@ -907,13 +1019,14 @@ def electric_construction_single_recommendation(bid, df_bid, base_rate):
         if len(recent90)>=10:
             std=float(np.std(recent90[rate]))
             w=0.10 if std>=0.55 else 0.15
-            items.append(("최근90일", robust_rate_center(recent90[rate]), w, len(recent90)))
+            items.append((f"최근90일(변동성 {std:.4f}, 가중 {w:.2f})", robust_rate_center(recent90[rate]), w, len(recent90)))
     if not items:
         items.append(("전기공사전체최근", robust_rate_center(d[rate].tail(100)), 1.0, min(len(d),100)))
     vals=[]; weights=[]; notes=[]
     for label,val,w,n in items:
         if val is not None and np.isfinite(float(val)):
-            vals.append(float(val)); weights.append(w); notes.append(f"{label} n={n}")
+            vals.append(float(val)); weights.append(w)
+            notes.append(f"{label} n={n}, 중심 {float(val):+.4f}%, 원가중 {w:.2f}")
     if not vals:
         return round(float(base_rate),4), "전기공사 단일추천: 산정 후보 부족으로 중심모델 유지"
     pred=float(np.average(vals, weights=weights))
@@ -931,6 +1044,9 @@ def apply_single_electric_construction_correction(rec, bid, df_bid):
     adjusted,note=electric_construction_single_recommendation(bid, df_bid, item.get("rate",0))
     item["rate"]=adjusted
     item["role"]="전기공사 단일 1순위"
+    item["model"]="electric_construction_single"
+    item["model_label"]="전기공사 단일 1순위"
+    item["basis_n"]=int(len(df_bid)) if df_bid is not None else 0
     item["basis"]=(note + "; 기준 중심값 " + f"{float(rec.get('rate',0)):+.4f}%")
     return item
 
@@ -1091,10 +1207,25 @@ def build_company_recommendations(bid, improved, a1, a2, a3, df_c):
     company3,company3_basis=company3_line_recommendation(
         org_df,rate,center
     )
+    center_model=(improved or {}).get("model","fallback_mean")
+    center_model_label=(improved or {}).get("model_label","사용 가능한 분석값 평균")
+    center_basis_n=int((improved or {}).get("basis_n",len(recent)))
     return [
-        {"company":"업체 1", "rate":company1, "role":"방향성 헷지", "basis":"방향성 헷지: "+company1_basis},
-        {"company":"업체 2", "rate":round(center,4), "role":"중심모델", "basis":center_basis},
-        {"company":"업체 3", "rate":company3, "role":"라인 헷지", "basis":"라인 헷지: "+company3_basis},
+        {
+            "company":"업체 1", "rate":company1, "role":"방향성 헷지",
+            "model":"direction_hedge", "model_label":"방향성 헷지",
+            "basis_n":max(len(org_df),len(service_df)), "basis":"방향성 헷지: "+company1_basis,
+        },
+        {
+            "company":"업체 2", "rate":round(center,4), "role":"중심모델",
+            "model":center_model, "model_label":center_model_label,
+            "basis_n":center_basis_n, "basis":center_basis,
+        },
+        {
+            "company":"업체 3", "rate":company3, "role":"라인 헷지",
+            "model":"line_hedge", "model_label":"0.02%p 라인 헷지",
+            "basis_n":len(org_df), "basis":"라인 헷지: "+company3_basis,
+        },
     ]
 
 def apply_company_count(recommendations, scope_info, df_bid=None, bid=None):
@@ -1649,8 +1780,27 @@ def make_excel(results):
 
     buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf
 
-def make_excel_simple(results):
-    """화면과 동일하게 최대 3개 업체 추천값과 산정 근거만 내보낸다."""
+def recommendation_reference_amount(base_amount, rate):
+    """낙찰하한율을 반영하지 않은 추천 사정률 기준 예정가격 성격의 금액."""
+    try:
+        base=float(base_amount or 0)
+        return int(base*(100+float(rate))/100) if base>0 else None
+    except (TypeError,ValueError):
+        return None
+
+def recommendation_overlay_fields(rec):
+    basis=str((rec or {}).get("basis", ""))
+    recent_match=re.search(r"(?:최근 n|최근90일(?:\([^)]*\))? n)=(\d+)",basis)
+    std_match=re.search(r"변동성\s+([0-9.]+)",basis)
+    weight_match=re.search(r"(?:최근가중|가중)\s+([0-9.]+)",basis)
+    return {
+        "recent_n":int(recent_match.group(1)) if recent_match else None,
+        "recent_std":float(std_match.group(1)) if std_match else None,
+        "recent_weight":float(weight_match.group(1)) if weight_match else None,
+    }
+
+def make_excel_simple(results, quality=None):
+    """화면 추천값, 추천기준금액, 모델·표본·데이터 품질 근거를 내보낸다."""
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
@@ -1660,11 +1810,22 @@ def make_excel_simple(results):
     navy="FF1a2744"; fills=["FFfee2e2","FFdbeafe","FFdcfce7"]
     thin=Side(style="thin",color="FFd1d5db")
     border=Border(left=thin,right=thin,top=thin,bottom=thin)
-    headers=["No","공고번호","공고명","발주기관","기초금액(억)","마감",
-             "업체1추천","업체2추천","업체3추천","비고"]
-    widths=[6,18,44,22,14,14,15,15,15,68]
+    headers=[
+        "No","공고번호","공고명","발주기관","용역분류","입찰범위","참여업체수",
+        "기초금액(원)","마감",
+    ]
+    widths=[6,20,44,28,14,18,12,18,15]
+    for pos in range(1,4):
+        headers.extend([
+            f"업체{pos} 추천사정률(%)",f"업체{pos} 추천기준금액(원)",
+            f"업체{pos} 적용모델",f"업체{pos} 표본수",f"업체{pos} 최근90일표본",
+            f"업체{pos} 최근90일변동성",f"업체{pos} 최근90일가중치",f"업체{pos} 산정근거",
+        ])
+        widths.extend([16,20,22,11,15,17,17,58])
+    headers.extend(["데이터품질경고","모델버전"])
+    widths.extend([72,13])
     ws.merge_cells(start_row=1,start_column=1,end_row=1,end_column=len(headers))
-    title=ws.cell(1,1,f"최대 3개 업체 추천 사정율 — {datetime.now().strftime('%Y.%m.%d')}")
+    title=ws.cell(1,1,f"최대 3개 업체 추천 사정률·추천기준금액 — {MODEL_VERSION} / {datetime.now().strftime('%Y.%m.%d')}")
     title.font=Font(name="맑은 고딕",bold=True,size=14,color="FFFFFFFF")
     title.fill=PatternFill("solid",start_color=navy)
     title.alignment=Alignment(horizontal="center",vertical="center")
@@ -1681,38 +1842,48 @@ def make_excel_simple(results):
         scope_info=row.get("scope_info") or {}
         company_count=int(scope_info.get("company_count",3))
         is_scoped=bool(scope_info.get("applicable"))
-        base=[bid["no"],bid.get("bid_no",""),bid["name"],bid["org"],
-              bid["base_억"] if bid["base"]>0 else "미정",bid["deadline"]]
-        rates=[]
-        notes=[]
-        if is_scoped:
-            notes.append(
-                f"입찰구분: {scope_info['scope']} / 참여 {company_count}개사 / "
-                f"{scope_info['basis']}"
-            )
+        service_label=SERVICE_LABELS.get(
+            classify_service(bid.get("name",""),bid.get("industry","")),"기타"
+        )
+        values=[
+            bid["no"],bid.get("bid_no",""),bid["name"],bid["org"],service_label,
+            scope_info.get("scope","기존분석"),company_count,
+            int(bid["base"]) if bid.get("base",0)>0 else None,bid["deadline"],
+        ]
         for pos in range(3):
             if pos<len(recs):
-                rates.append(recs[pos]["rate"])
-                notes.append(f"업체{pos+1}: {recs[pos]['basis']}")
+                rec=recs[pos]
+                overlay=recommendation_overlay_fields(rec)
+                values.extend([
+                    float(rec["rate"]),recommendation_reference_amount(bid.get("base",0),rec["rate"]),
+                    rec.get("model_label",rec.get("role","")),int(rec.get("basis_n",0) or 0),
+                    overlay["recent_n"],overlay["recent_std"],overlay["recent_weight"],rec.get("basis",""),
+                ])
             elif is_scoped and pos>=company_count:
-                rates.append("참여대상 없음")
-                notes.append(f"업체{pos+1}: 참여대상 없음")
+                values.extend(["참여대상 없음",None,"참여대상 없음",None,None,None,None,"참여대상 없음"])
             else:
-                rates.append("-")
-                notes.append(f"업체{pos+1}: 데이터 부족")
-        values=base+rates+["\n".join(notes)]
+                values.extend([None,None,"데이터 부족",None,None,None,None,"데이터 부족"])
+        row_warning=history_quality_warning(quality)
+        if is_electric_construction_bid(bid) and simple_region(bid.get("region",""))=="지역미상":
+            row_warning="전기공사 지역 미상: 지역요소 제외·잔여가중치 재정규화; "+row_warning
+        values.extend([row_warning,MODEL_VERSION])
         for col,value in enumerate(values,1):
             cell=ws.cell(idx,col,value)
-            cell.font=Font(name="맑은 고딕",size=9,bold=col in (7,8,9))
-            cell.alignment=Alignment(horizontal="right" if col in (5,7,8,9) else "left",
+            cell.font=Font(name="맑은 고딕",size=9)
+            cell.alignment=Alignment(horizontal="right" if isinstance(value,(int,float)) else "left",
                                      vertical="center",wrap_text=True)
             cell.border=border
-            if col==7: cell.fill=PatternFill("solid",start_color=fills[0])
-            if col==8: cell.fill=PatternFill("solid",start_color=fills[1])
-            if col==9: cell.fill=PatternFill("solid",start_color=fills[2])
-            if col in (7,8,9) and isinstance(value,(int,float)):
-                cell.number_format="+0.0000;-0.0000"
-        ws.row_dimensions[idx].height=68 if is_scoped else 52
+            for rec_pos,start_col in enumerate((10,18,26)):
+                if start_col<=col<=start_col+7:
+                    cell.fill=PatternFill("solid",start_color=fills[rec_pos])
+                if col==start_col and isinstance(value,(int,float)):
+                    cell.number_format="+0.0000;-0.0000"
+                elif col==start_col+1 and isinstance(value,(int,float)):
+                    cell.number_format="#,##0"
+                elif col in (start_col+5,start_col+6) and isinstance(value,(int,float)):
+                    cell.number_format="0.0000"
+            if col in (8,): cell.number_format="#,##0"
+        ws.row_dimensions[idx].height=82
     ws.freeze_panes="A3"
     buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf
 
@@ -1721,8 +1892,8 @@ def make_excel_simple(results):
 # ════════════════════════════════════════════════════════════════
 st.markdown("""
 <div class="main-header">
-<h2>📊 투찰전략 분석 시스템 v2.15.3</h2>
-<p style="margin:0;opacity:0.8">입찰 참여조건에 따른 최대 3개 업체 추천 사정율과 산정 근거</p>
+<h2>📊 투찰전략 분석 시스템 v2.15.4</h2>
+<p style="margin:0;opacity:0.8">입찰 참여조건에 따른 최대 3개 업체 추천 사정률·추천기준금액과 산정 근거</p>
 </div>""", unsafe_allow_html=True)
 
 with st.sidebar:
@@ -1730,10 +1901,18 @@ with st.sidebar:
     mode=st.radio("모드 선택",["📊 투찰전략 분석","🔧 배포자 관리"])
     st.divider()
     df_hist=load_history(); pattern_stats=load_pattern_stats()
+    quality_info=load_history_quality(df_hist) if df_hist is not None else {}
     if df_hist is not None:
         df_c_s=df_hist[df_hist["예가/기초(0%)"].notna()&(df_hist["예가/기초(0%)"].abs()<10)]
         n_c=len(df_c_s); n_o=df_c_s["발주기관"].nunique()
         st.success(f"✅ 낙찰이력 {n_c:,}건\n{n_o}개 발주처")
+        with st.expander("🔎 낙찰이력 데이터 품질"):
+            st.caption(history_quality_warning(quality_info))
+            if int(quality_info.get("electric_region_missing_rows",0))>0:
+                st.warning(
+                    "전기공사 지역 누락 행은 동일지역 요소를 제외하고 "
+                    "사용 가능한 나머지 가중치를 재정규화합니다."
+                )
     else:
         st.warning("⚠️ 낙찰이력 없음"); df_c_s=None; n_c=0; n_o=0
     if pattern_stats:
@@ -1758,19 +1937,24 @@ if mode=="🔧 배포자 관리":
                 missing=[c for c in required if c not in df_new.columns]
                 if missing: st.error(f"필수 컬럼 없음: {missing}")
                 else:
-                    save_history(df_new)
-                    df_v=df_new[df_new["예가/기초(0%)"].notna()&(df_new["예가/기초(0%)"].abs()<10)]
+                    quality_info=save_history(df_new)
+                    df_clean=prepare_history_frame(df_new)
+                    target=pd.to_numeric(df_clean["예가/기초(0%)"],errors="coerce")
+                    df_v=df_clean[target.notna()&(target.abs()<10)]
                     st.success("✅ 업로드 완료!")
-                    c1,c2,c3=st.columns(3)
+                    c1,c2,c3,c4=st.columns(4)
                     c1.metric("총 건수",f"{len(df_v):,}건")
                     c2.metric("발주처 수",f"{df_v['발주기관'].nunique()}개")
                     c3.metric("평균 사정율",f"{df_v['예가/기초(0%)'].mean():+.4f}%")
+                    c4.metric("완전 동일 중복 제거",f"{quality_info.get('exact_duplicates',0):,}건")
+                    st.info(history_quality_warning(quality_info))
             except Exception as e: st.error(f"오류: {e}")
 
 # ══ 투찰전략 분석 ════════════════════════════════════════════════
 else:
     df_hist=load_history()
     df_c = df_hist[df_hist["예가/기초(0%)"].notna()&(df_hist["예가/기초(0%)"].abs()<10)].copy() if df_hist is not None else None
+    quality_info=load_history_quality(df_hist) if df_hist is not None else {}
     pattern_stats=load_pattern_stats()
 
     st.header("📊 투찰전략 분석")
@@ -1784,11 +1968,14 @@ else:
         <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:12px;font-size:0.9em">
         <b>📌 분석 방법</b><br>
         1️⃣ <b>업체 1:</b> 방향성 헷지 — 부호패턴 + 직전 2건 차이<br>
-        2️⃣ <b>업체 2:</b> 중심모델 — 백테스트 최적모델 + 최근90일 오버레이<br>
+        2️⃣ <b>업체 2:</b> 중심모델 — 백테스트 최적모델 + 최근90일 보수 오버레이<br>
         3️⃣ <b>업체 3:</b> 라인 헷지 — 0.02 라인 + 직전 패턴 최다빈도<br><br>
+        <b>정렬:</b> 개찰일 → 공고번호 → 번호 안정 정렬(동일일 재현성 고정)<br>
         <b>참여:</b> 한전 전국 감리 3개사 · 전기공사 1개사 · 기타 진단·설계 등 3개사<br>
         <b>데이터:</b> {nc:,}건 | {no}개 발주처
         </div>""",unsafe_allow_html=True)
+    if quality_info:
+        st.caption("데이터 품질: "+history_quality_warning(quality_info))
 
     if not xls_file:
         st.info("👆 입찰서류함 xls 파일을 업로드하면 자동 분석합니다."); st.stop()
@@ -1846,7 +2033,7 @@ else:
                             "recommendations":recommendations})
 
     # ── 요약 테이블: 최종 추천값과 근거만 표시 ───────────────
-    st.subheader(f"📋 최대 3개 업체 추천 사정율 — {datetime.now().strftime('%Y.%m.%d')} ({len(bids)}건)")
+    st.subheader(f"📋 최대 3개 업체 추천 사정률·추천기준금액 — {datetime.now().strftime('%Y.%m.%d')} ({len(bids)}건)")
     rows=[]
     for row in results:
         b=row["bid"]; recs=row.get("recommendations") or []
@@ -1874,11 +2061,23 @@ else:
             else "없음"
             for i in range(3)
         ]
+        display_amounts=[
+            (
+                f"{recommendation_reference_amount(b.get('base',0),recs[i]['rate']):,}원"
+                if i<len(recs) and recommendation_reference_amount(b.get('base',0),recs[i]['rate']) is not None
+                else "참여대상 없음" if is_scoped and i>=company_count
+                else "없음"
+            )
+            for i in range(3)
+        ]
         rows.append({
             "공고명":b["name"][:40]+"…" if len(b["name"])>40 else b["name"],
             "업체1추천":display_vals[0],
+            "업체1추천기준금액":display_amounts[0],
             "업체2추천":display_vals[1],
+            "업체2추천기준금액":display_amounts[1],
             "업체3추천":display_vals[2],
+            "업체3추천기준금액":display_amounts[2],
             "비고":"\n".join(notes)
         })
     summary_df=pd.DataFrame(rows)
@@ -1908,17 +2107,26 @@ else:
                     f"{scope_info['scope']} · 참여 {scope_info['company_count']}개사 · "
                     f"{scope_info['basis']}"
                 )
+            if is_electric_construction_bid(b) and simple_region(b.get("region",""))=="지역미상":
+                st.warning("지역 정보가 없어 동일지역 요소를 제외하고 나머지 가중치를 재정규화했습니다.")
             if recs:
                 cols=st.columns(len(recs))
                 styles=["val-a","val-b","val-c"]
                 for col,rec,style in zip(cols,recs,styles):
                     with col:
-                        amount=f"<br>{int(b['base']*(100+rec['rate'])/100):,}원" if b['base']>0 else ""
+                        amount_value=recommendation_reference_amount(b.get("base",0),rec["rate"])
+                        amount=(
+                            f"<br><small>추천기준금액</small><br>{amount_value:,}원"
+                            if amount_value is not None else ""
+                        )
                         st.markdown(
                             f'<div class="{style}">🏢 {rec["company"]}<br>{rec["rate"]:+.4f}%{amount}</div>',
                             unsafe_allow_html=True
                         )
-                        st.caption(f"산정 근거: {rec['basis']}")
+                        st.caption(
+                            f"적용 모델: {rec.get('model_label',rec.get('role','-'))} · "
+                            f"표본 {int(rec.get('basis_n',0) or 0):,}건 · 산정 근거: {rec['basis']}"
+                        )
             else:
                 st.warning("추천값을 계산할 낙찰이력이 부족합니다.")
 
@@ -1950,7 +2158,7 @@ else:
 
     st.divider()
     st.subheader("💾 전략표 다운로드")
-    excel_buf=make_excel_simple(results)
+    excel_buf=make_excel_simple(results,quality_info)
     today_str=datetime.now().strftime("%Y%m%d")
     st.download_button("📥 업체 추천표 다운로드",
         data=excel_buf,
