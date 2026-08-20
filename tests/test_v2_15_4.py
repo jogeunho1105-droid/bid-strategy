@@ -187,7 +187,141 @@ class V2154Tests(unittest.TestCase):
         self.assertIn("업체1 최근90일가중치", headers)
         self.assertIn("데이터품질경고", headers)
         self.assertEqual(ws.cell(3, 11).value, 100_100_000)
-        self.assertEqual(ws.cell(3, len(headers)).value, "v2.15.4")
+        self.assertEqual(ws.cell(3, len(headers)).value, "v2.15.5")
+
+    def test_busan_local_company_count_amount_boundaries(self):
+        common = {
+            "org": "한국전력공사 부산울산본부",
+            "name": "부산 지역제한 감리용역",
+            "industry": "전력감리",
+            "deadline": datetime(2026, 8, 31),
+        }
+        cases = [
+            (99_999_999, "지역제한", 2),
+            (100_000_000, "지역제한", 3),
+            (252_999_999, "지역제한", 3),
+            (253_000_000, "전국입찰", 3),
+        ]
+        for base, expected_scope, expected_count in cases:
+            with self.subTest(base=base):
+                scope = self.app["classify_kepco_scope"]({**common, "base": base})
+                self.assertEqual(scope["scope"], expected_scope)
+                self.assertEqual(scope["company_count"], expected_count)
+
+        below = self.app["classify_kepco_scope"]({**common, "base": 99_999_999})
+        at_threshold = self.app["classify_kepco_scope"]({**common, "base": 100_000_000})
+        self.assertIn("기초금액 1억원 미만", below["basis"])
+        self.assertIn("기초금액 1억원 이상", at_threshold["basis"])
+
+    def test_historical_notice_amount_boundaries_remain_unchanged(self):
+        common = {
+            "org": "한국전력공사 부산울산본부",
+            "name": "부산 지역제한 감리용역",
+            "industry": "전력감리",
+        }
+        cases = [
+            (datetime(2022, 12, 31), 230_999_999, "지역제한", 3),
+            (datetime(2022, 12, 31), 231_000_000, "전국입찰", 3),
+            (datetime(2024, 12, 31), 241_999_999, "지역제한", 3),
+            (datetime(2024, 12, 31), 242_000_000, "전국입찰", 3),
+        ]
+        for deadline, base, expected_scope, expected_count in cases:
+            with self.subTest(deadline=deadline, base=base):
+                scope = self.app["classify_kepco_scope"](
+                    {**common, "deadline": deadline, "base": base}
+                )
+                self.assertEqual(scope["scope"], expected_scope)
+                self.assertEqual(scope["company_count"], expected_count)
+
+    def test_existing_kepco_and_non_supervision_counts_do_not_change(self):
+        deadline = datetime(2026, 8, 31)
+        for org in ("한국전력공사 경북본부", "한국전력공사 대구본부"):
+            with self.subTest(org=org):
+                scope = self.app["classify_kepco_scope"](
+                    {
+                        "org": org,
+                        "name": "배전공사 감리용역",
+                        "industry": "전력감리",
+                        "base": 100_000_000,
+                        "deadline": deadline,
+                    }
+                )
+                self.assertEqual(scope["scope"], "지역제한")
+                self.assertEqual(scope["company_count"], 1)
+
+        non_supervision = self.app["classify_kepco_scope"](
+            {
+                "org": "한국전력공사 부산울산본부",
+                "name": "배전선로 설계용역",
+                "industry": "전력설계",
+                "base": 100_000_000,
+                "deadline": deadline,
+            }
+        )
+        self.assertFalse(non_supervision["applicable"])
+        self.assertEqual(non_supervision["company_count"], 3)
+
+    def test_busan_three_company_rule_exposes_line_hedge(self):
+        recommendations = [
+            {"company": "업체 1", "rate": -0.1, "role": "방향성 헷지"},
+            {"company": "업체 2", "rate": 0.0, "role": "중심모델"},
+            {"company": "업체 3", "rate": 0.1, "role": "라인 헷지"},
+        ]
+        bid = {
+            "org": "한국전력공사 부산울산본부",
+            "name": "부산 지역제한 감리용역",
+            "industry": "전력감리",
+            "base": 100_000_000,
+            "deadline": datetime(2026, 8, 31),
+        }
+        scope = self.app["classify_kepco_scope"](bid)
+        selected = self.app["apply_company_count"](recommendations, scope, None, bid)
+        self.assertEqual(len(selected), 3)
+        self.assertEqual(selected[2]["role"], "라인 헷지")
+
+    def test_busan_three_company_excel_contains_company3(self):
+        bid = {
+            "no": 1,
+            "bid_no": "BUSAN-100M",
+            "name": "부산 지역제한 감리용역",
+            "org": "한국전력공사 부산울산본부",
+            "industry": "전력감리",
+            "region": "부산",
+            "base": 100_000_000,
+            "deadline": "2026-08-31",
+        }
+        scope = self.app["classify_kepco_scope"](bid)
+        recommendations = [
+            {
+                "company": f"업체 {position}",
+                "rate": rate,
+                "role": role,
+                "model_label": role,
+                "basis_n": 12,
+                "basis": f"{role} 검증",
+            }
+            for position, rate, role in (
+                (1, -0.1, "방향성 헷지"),
+                (2, 0.0, "중심모델"),
+                (3, 0.1, "라인 헷지"),
+            )
+        ]
+        output = self.app["make_excel_simple"](
+            [{"bid": bid, "scope_info": scope, "recommendations": recommendations}],
+            {},
+        )
+        wb = load_workbook(io.BytesIO(output.getvalue()), data_only=False)
+        ws = wb["업체별 추천"]
+        headers = [cell.value for cell in ws[2]]
+        row = {header: ws.cell(3, index + 1).value for index, header in enumerate(headers)}
+        self.assertEqual(row["참여업체수"], 3)
+        self.assertEqual(row["업체3 추천사정률(%)"], 0.1)
+        self.assertEqual(row["업체3 추천기준금액(원)"], 100_100_000)
+        self.assertEqual(row["업체3 적용모델"], "라인 헷지")
+        self.assertIn("입찰구분: 지역제한", row["입찰판정근거"])
+        self.assertIn("참여업체: 3개사", row["입찰판정근거"])
+        self.assertIn("기초금액 1억원 이상", row["입찰판정근거"])
+        self.assertEqual(row["모델버전"], "v2.15.5")
 
 
 if __name__ == "__main__":

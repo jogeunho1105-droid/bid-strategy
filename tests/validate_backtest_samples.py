@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import json
 import re
+import warnings
 from datetime import datetime
 from pathlib import Path
 
@@ -10,12 +11,15 @@ import numpy as np
 import pandas as pd
 
 
+warnings.filterwarnings("ignore", message="Could not infer format")
+
+
 ROOT = Path(__file__).resolve().parents[1]
 PROJECT = ROOT.parents[1]
 APP = ROOT / "입찰 앱.py"
 SOURCE = Path(r"C:\Users\USER\OneDrive - (주)와이앤제이이앤씨\운영관리\입찰분석\낙찰데이터.xlsx")
-DETAIL = ROOT / "tests" / "backtest_codecheck" / "backtest_detail.csv"
-OUTPUT = ROOT / "tests" / "v2.15.4_code_validation.json"
+DETAIL = ROOT / "analysis" / "results" / "v2.15.5" / "impact_detail.csv"
+OUTPUT = ROOT / "tests" / "v2.15.5_code_validation.json"
 
 
 def load_app_namespace() -> dict:
@@ -82,6 +86,7 @@ def main() -> None:
     ].copy()
     valid = valid.sort_values(["_date", "공고번호", "번호"], kind="mergesort")
     detail = pd.read_csv(DETAIL, parse_dates=["개찰일"])
+    detail["표본출처"] = "v2.15.5 최신 전체 백테스트"
     sample_frames = []
     for label, frame in detail.groupby("분석구분", sort=False):
         indexes = np.linspace(0, len(frame) - 1, min(3, len(frame))).astype(int)
@@ -101,11 +106,7 @@ def main() -> None:
         history = valid[valid["_date"] < sample["개찰일"]].drop(columns=["_date"]).copy()
         actual_recs = run_recommendations(app, source, history)
         actual = [float(rec["rate"]) for rec in actual_recs]
-        prefix = (
-            "현행" if sample["분석구분"] in
-            ["전기공사 단일참여 1개사", "한전 감리 지역제한 1개사"]
-            else "후보"
-        )
+        prefix = "제안"
         expected = [
             float(sample[column])
             for column in (f"{prefix}추천1", f"{prefix}추천2", f"{prefix}추천3")
@@ -118,6 +119,7 @@ def main() -> None:
                 "공고번호": str(sample["공고번호"]),
                 "분석구분": sample["분석구분"],
                 "개찰일": sample["개찰일"].strftime("%Y-%m-%d"),
+                "표본출처": sample["표본출처"],
                 "코드추천": actual,
                 "코드근거": [rec.get("basis","") for rec in actual_recs],
                 "백테스트제안": expected,

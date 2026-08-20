@@ -1,6 +1,6 @@
 # ╔══════════════════════════════════════════════════════════════════╗
-# ║  투찰전략 분석 시스템 v2.15.4                                   ║
-# ║  개선: 동일일 안정 정렬 + 최근 90일 오버레이 보수화            ║
+# ║  투찰전략 분석 시스템 v2.15.5                                   ║
+# ║  개선: 부산울산본부 지역제한 1억원 이상 3개사 반영             ║
 # ║  - 완전 동일 중복 제거 및 데이터 품질 경고                     ║
 # ║  - 업체1·업체3은 헷지 포인트, 업체2는 중심모델로 명확화       ║
 # ║  - 전기공사 단일참여 1순위 추천모델 추가                       ║
@@ -54,7 +54,7 @@ HISTORY_FILE = os.path.join(DATA_DIR, "history.pkl")
 HISTORY_QUALITY_FILE = os.path.join(DATA_DIR, "history_quality.json")
 PATTERN_FILE = os.path.join(DATA_DIR, "pattern_stats.json")
 BUNDLED_PATTERN_FILE = "pattern_stats.json"
-MODEL_VERSION = "v2.15.4"
+MODEL_VERSION = "v2.15.5"
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # ── 3포인트 전략 DB (분위수 기반, 30,614건 2026-05-13 업데이트) ─
@@ -438,6 +438,22 @@ KEPCO_LOCAL_ORGS = {
     "한국전력공사 대구본부": 1,
 }
 KEPCO_NATIONAL_COMPANY_COUNT = 3
+KEPCO_BUSAN_ULSAN_ORG = "한국전력공사 부산울산본부"
+KEPCO_BUSAN_THREE_COMPANY_BASE_THRESHOLD = 100_000_000
+
+def kepco_local_company_count(org, base):
+    """한전 지역제한 감리의 실제 참여 가능 업체 수를 반환한다."""
+    default_count=int(KEPCO_LOCAL_ORGS.get(str(org),KEPCO_NATIONAL_COMPANY_COUNT))
+    try:
+        base_amount=float(base or 0)
+    except (TypeError, ValueError):
+        base_amount=0.0
+    if (
+        str(org)==KEPCO_BUSAN_ULSAN_ORG
+        and base_amount>=KEPCO_BUSAN_THREE_COMPANY_BASE_THRESHOLD
+    ):
+        return 3
+    return default_count
 
 def notice_amount_for_year(year):
     """물품·용역 고시금액. 2021~2026 운영 기준을 2년 단위로 적용한다."""
@@ -497,11 +513,16 @@ def classify_kepco_scope(bid):
 
     if org in KEPCO_LOCAL_ORGS and is_below_notice:
         scope="지역제한"
-        company_count=KEPCO_LOCAL_ORGS[org]
+        company_count=kepco_local_company_count(org,base)
         basis=(
             f"{year}년 고시금액 {notice/1e8:.1f}억원 미만 "
             f"(추정가격 {estimated/1e8:.4f}억원)"
         )
+        if org==KEPCO_BUSAN_ULSAN_ORG:
+            if company_count==3:
+                basis+=("; 기초금액 1억원 이상으로 부산울산본부 참여 3개사")
+            else:
+                basis+=("; 기초금액 1억원 미만으로 부산울산본부 참여 2개사")
     else:
         scope="전국입찰"
         company_count=KEPCO_NATIONAL_COMPANY_COUNT
@@ -1822,8 +1843,8 @@ def make_excel_simple(results, quality=None):
             f"업체{pos} 최근90일변동성",f"업체{pos} 최근90일가중치",f"업체{pos} 산정근거",
         ])
         widths.extend([16,20,22,11,15,17,17,58])
-    headers.extend(["데이터품질경고","모델버전"])
-    widths.extend([72,13])
+    headers.extend(["입찰판정근거","데이터품질경고","모델버전"])
+    widths.extend([62,72,13])
     ws.merge_cells(start_row=1,start_column=1,end_row=1,end_column=len(headers))
     title=ws.cell(1,1,f"최대 3개 업체 추천 사정률·추천기준금액 — {MODEL_VERSION} / {datetime.now().strftime('%Y.%m.%d')}")
     title.font=Font(name="맑은 고딕",bold=True,size=14,color="FFFFFFFF")
@@ -1866,7 +1887,12 @@ def make_excel_simple(results, quality=None):
         row_warning=history_quality_warning(quality)
         if is_electric_construction_bid(bid) and simple_region(bid.get("region",""))=="지역미상":
             row_warning="전기공사 지역 미상: 지역요소 제외·잔여가중치 재정규화; "+row_warning
-        values.extend([row_warning,MODEL_VERSION])
+        scope_basis=(
+            f"입찰구분: {scope_info.get('scope','기존분석')} / "
+            f"참여업체: {company_count}개사 / "
+            f"적용근거: {scope_info.get('basis','기존 분석 기준')}"
+        )
+        values.extend([scope_basis,row_warning,MODEL_VERSION])
         for col,value in enumerate(values,1):
             cell=ws.cell(idx,col,value)
             cell.font=Font(name="맑은 고딕",size=9)
@@ -1892,7 +1918,7 @@ def make_excel_simple(results, quality=None):
 # ════════════════════════════════════════════════════════════════
 st.markdown("""
 <div class="main-header">
-<h2>📊 투찰전략 분석 시스템 v2.15.4</h2>
+<h2>📊 투찰전략 분석 시스템 v2.15.5</h2>
 <p style="margin:0;opacity:0.8">입찰 참여조건에 따른 최대 3개 업체 추천 사정률·추천기준금액과 산정 근거</p>
 </div>""", unsafe_allow_html=True)
 
@@ -1971,7 +1997,7 @@ else:
         2️⃣ <b>업체 2:</b> 중심모델 — 백테스트 최적모델 + 최근90일 보수 오버레이<br>
         3️⃣ <b>업체 3:</b> 라인 헷지 — 0.02 라인 + 직전 패턴 최다빈도<br><br>
         <b>정렬:</b> 개찰일 → 공고번호 → 번호 안정 정렬(동일일 재현성 고정)<br>
-        <b>참여:</b> 한전 전국 감리 3개사 · 전기공사 1개사 · 기타 진단·설계 등 3개사<br>
+        <b>참여:</b> 부산울산 지역제한 감리 1억원 이상 3개사·미만 2개사 · 한전 전국 감리 3개사 · 전기공사 1개사<br>
         <b>데이터:</b> {nc:,}건 | {no}개 발주처
         </div>""",unsafe_allow_html=True)
     if quality_info:
