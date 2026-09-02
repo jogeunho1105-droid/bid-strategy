@@ -187,7 +187,29 @@ class V2154Tests(unittest.TestCase):
         self.assertIn("업체1 최근90일가중치", headers)
         self.assertIn("데이터품질경고", headers)
         self.assertEqual(ws.cell(3, 11).value, 100_100_000)
-        self.assertEqual(ws.cell(3, len(headers)).value, "v2.15.5")
+        self.assertEqual(ws.cell(3, len(headers)).value, "v2.15.6")
+        self.assertEqual(wb.sheetnames, ["업체별 추천", "사후낙찰검증", "검증기준"])
+        audit_ws = wb["사후낙찰검증"]
+        self.assertEqual(audit_ws.cell(3, 1).value, "N-1")
+        self.assertEqual(audit_ws.cell(3, 6).value, 0.1)
+        self.assertEqual(audit_ws.cell(3, 11).value, '=IFERROR(CHOOSE(J3,F3,G3,H3),"")')
+        self.assertIn("COUNT(K3,M3,N3)<3", audit_ws.cell(3, 18).value)
+        self.assertIn("AND(M3<K3,K3<N3)", audit_ws.cell(3, 18).value)
+        self.assertIn("COUNT(L3,M3,N3)<3", audit_ws.cell(3, 19).value)
+        self.assertIn("AND(M3<L3,L3<N3)", audit_ws.cell(3, 19).value)
+        basis_ws = wb["검증기준"]
+        self.assertEqual(basis_ws.cell(2, 2).value, "2026-09-01")
+        self.assertEqual(basis_ws.cell(6, 2).value, 0.1423506011)
+
+    def test_quality_summary_includes_history_period(self):
+        frame = self.history()
+        quality = self.app["history_quality_summary"](frame)
+        self.assertEqual(quality["data_start_date"], "2026-06-01")
+        self.assertEqual(quality["data_end_date"], "2026-08-17")
+        self.assertEqual(
+            self.app["history_period_text"](quality),
+            "이력 기간 2026-06-01 ~ 2026-08-17",
+        )
 
     def test_busan_local_company_count_amount_boundaries(self):
         common = {
@@ -321,7 +343,7 @@ class V2154Tests(unittest.TestCase):
         self.assertIn("입찰구분: 지역제한", row["입찰판정근거"])
         self.assertIn("참여업체: 3개사", row["입찰판정근거"])
         self.assertIn("기초금액 1억원 이상", row["입찰판정근거"])
-        self.assertEqual(row["모델버전"], "v2.15.5")
+        self.assertEqual(row["모델버전"], "v2.15.6")
 
 
 if __name__ == "__main__":

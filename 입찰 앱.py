@@ -1,6 +1,6 @@
 # ╔══════════════════════════════════════════════════════════════════╗
-# ║  투찰전략 분석 시스템 v2.15.5                                   ║
-# ║  개선: 부산울산본부 지역제한 1억원 이상 3개사 반영             ║
+# ║  투찰전략 분석 시스템 v2.15.6                                   ║
+# ║  개선: 엄격 가상낙찰 검증 공개 + 사후 낙찰검증 기록지 추가     ║
 # ║  - 완전 동일 중복 제거 및 데이터 품질 경고                     ║
 # ║  - 업체1·업체3은 헷지 포인트, 업체2는 중심모델로 명확화       ║
 # ║  - 전기공사 단일참여 1순위 추천모델 추가                       ║
@@ -54,7 +54,22 @@ HISTORY_FILE = os.path.join(DATA_DIR, "history.pkl")
 HISTORY_QUALITY_FILE = os.path.join(DATA_DIR, "history_quality.json")
 PATTERN_FILE = os.path.join(DATA_DIR, "pattern_stats.json")
 BUNDLED_PATTERN_FILE = "pattern_stats.json"
-MODEL_VERSION = "v2.15.5"
+MODEL_VERSION = "v2.15.6"
+AUDIT_SUMMARY = {
+    "as_of": "2026-09-01",
+    "source_rows": 56_367,
+    "valid_rows": 46_319,
+    "backtest_rows": 46_167,
+    "recent_1y_total": 11_949,
+    "recent_1y_evaluable": 11_563,
+    "recent_1y_virtual_wins": 1_646,
+    "recent_1y_virtual_win_rate": 0.1423506011,
+    "recent_1y_center_or_single_rate": 0.0918446770,
+    "recent_1y_single_company_rate": 0.0789955532,
+    "recent_1y_three_company_rate": 0.1746467818,
+    "rule": "예가/기초(0%) < 추천사정율 < 1순위사정율(0%)",
+    "decision": "일괄 상향보정 후보는 보류검증 신뢰구간이 0을 포함하여 미반영",
+}
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # ── 3포인트 전략 DB (분위수 기반, 30,614건 2026-05-13 업데이트) ─
@@ -179,6 +194,13 @@ def history_quality_summary(df):
         electric_mask=pd.Series(False,index=valid.index)
     electric_count=int(electric_mask.sum())
     electric_region_missing=int((electric_mask & region_missing).sum())
+    history_dates=pd.Series(dtype="datetime64[ns]")
+    for date_col in ("개찰일","입찰일","공고일","마감","투찰마감"):
+        if date_col in valid.columns:
+            parsed_dates=pd.to_datetime(valid[date_col],errors="coerce")
+            if parsed_dates.notna().any():
+                history_dates=parsed_dates.dropna()
+                break
     return {
         "source_rows":row_count,
         "exact_duplicates":exact_duplicates,
@@ -192,6 +214,8 @@ def history_quality_summary(df):
         "electric_region_missing_rate":(
             float(electric_region_missing/electric_count) if electric_count else 0.0
         ),
+        "data_start_date":history_dates.min().strftime("%Y-%m-%d") if len(history_dates) else None,
+        "data_end_date":history_dates.max().strftime("%Y-%m-%d") if len(history_dates) else None,
         "model_version":MODEL_VERSION,
     }
 
@@ -217,6 +241,16 @@ def history_quality_warning(quality):
         f"{int(quality.get('electric_rows',0)):,}행"
         f"({float(quality.get('electric_region_missing_rate',0)):.1%})"
     )
+
+def history_period_text(quality):
+    """업로드 이력에서 확인된 최초·최종 개찰일을 짧게 표시한다."""
+    if not quality:
+        return "이력 기간 확인 불가"
+    start=quality.get("data_start_date")
+    end=quality.get("data_end_date")
+    if start and end:
+        return f"이력 기간 {start} ~ {end}"
+    return "이력 기간 확인 불가"
 
 def save_history(df):
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -1821,10 +1855,11 @@ def recommendation_overlay_fields(rec):
     }
 
 def make_excel_simple(results, quality=None):
-    """화면 추천값, 추천기준금액, 모델·표본·데이터 품질 근거를 내보낸다."""
+    """추천표와 향후 실제 낙찰성과를 누적할 사후검증 기록지를 내보낸다."""
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
+    from openpyxl.worksheet.datavalidation import DataValidation
 
     wb=Workbook(); ws=wb.active; ws.title="업체별 추천"
     ws.sheet_view.showGridLines=False
@@ -1911,6 +1946,113 @@ def make_excel_simple(results, quality=None):
             if col in (8,): cell.number_format="#,##0"
         ws.row_dimensions[idx].height=82
     ws.freeze_panes="A3"
+
+    # 추천 당시 값과 개찰 후 실제값을 한 행에서 연결하는 운영 기록지.
+    # 추천식 변경이 아니라 향후 관측 실제 낙찰률 검증에 필요한 입력 구조를 제공한다.
+    audit_ws=wb.create_sheet("사후낙찰검증")
+    audit_ws.sheet_view.showGridLines=False
+    audit_headers=[
+        "공고번호","공고명","발주기관","입찰범위","참여업체수",
+        "업체1추천(%)","업체2추천(%)","업체3추천(%)","당사업체",
+        "적용추천순번","적용추천값(%)","실제투찰사정률(%)","예가/기초(0%)(%)",
+        "1순위사정율(0%)(%)","낙찰하한율(%)","무효/실격여부","최종결과",
+        "추천기준 가상판정","실제투찰 가상판정","메모","모델버전",
+    ]
+    audit_widths=[20,44,28,18,12,15,15,15,18,14,16,19,18,20,16,16,16,20,20,34,13]
+    audit_ws.merge_cells(start_row=1,start_column=1,end_row=1,end_column=len(audit_headers))
+    audit_title=audit_ws.cell(
+        1,1,
+        "사후 낙찰검증 기록지 — 개찰 후 노란색 입력란을 채우면 엄격 부등식으로 자동 판정",
+    )
+    audit_title.font=Font(name="맑은 고딕",bold=True,size=13,color="FFFFFFFF")
+    audit_title.fill=PatternFill("solid",start_color=navy)
+    audit_title.alignment=Alignment(horizontal="center",vertical="center")
+    audit_ws.row_dimensions[1].height=30
+    for col,(header,width) in enumerate(zip(audit_headers,audit_widths),1):
+        cell=audit_ws.cell(2,col,header)
+        cell.font=Font(name="맑은 고딕",bold=True,color="FFFFFFFF")
+        cell.fill=PatternFill("solid",start_color=navy)
+        cell.alignment=Alignment(horizontal="center",vertical="center",wrap_text=True)
+        cell.border=border
+        audit_ws.column_dimensions[get_column_letter(col)].width=width
+    input_fill=PatternFill("solid",start_color="FFfff2cc")
+    result_fill=PatternFill("solid",start_color="FFe2f0d9")
+    for idx,row in enumerate(results,3):
+        bid=row["bid"]; recs=row.get("recommendations") or []
+        scope_info=row.get("scope_info") or {}
+        rates=[float(recs[pos]["rate"]) if pos<len(recs) else None for pos in range(3)]
+        base_values=[
+            bid.get("bid_no",""),bid.get("name",""),bid.get("org",""),
+            scope_info.get("scope","기존분석"),int(scope_info.get("company_count",3)),
+            rates[0],rates[1],rates[2],"","","","","","","","","","","","",MODEL_VERSION,
+        ]
+        for col,value in enumerate(base_values,1):
+            cell=audit_ws.cell(idx,col,value)
+            cell.font=Font(name="맑은 고딕",size=9)
+            cell.alignment=Alignment(vertical="center",wrap_text=True)
+            cell.border=border
+            if col in (6,7,8,11,12,13,14,15) and isinstance(value,(int,float)):
+                cell.number_format="+0.0000;-0.0000"
+            if 9<=col<=17 or col==20:
+                cell.fill=input_fill
+            if col in (18,19):
+                cell.fill=result_fill
+        # 적용 추천순번은 사용자가 선택하고, 적용 추천값은 해당 추천열을 자동 참조한다.
+        audit_ws.cell(idx,11,f'=IFERROR(CHOOSE(J{idx},F{idx},G{idx},H{idx}),"")')
+        audit_ws.cell(
+            idx,18,
+            f'=IF(COUNT(K{idx},M{idx},N{idx})<3,"판정불가",'
+            f'IF(N{idx}<=M{idx},"판정불가",IF(AND(M{idx}<K{idx},K{idx}<N{idx}),"가상낙찰","미낙찰")))',
+        )
+        audit_ws.cell(
+            idx,19,
+            f'=IF(COUNT(L{idx},M{idx},N{idx})<3,"판정불가",'
+            f'IF(N{idx}<=M{idx},"판정불가",IF(AND(M{idx}<L{idx},L{idx}<N{idx}),"가상낙찰","미낙찰")))',
+        )
+        audit_ws.row_dimensions[idx].height=48
+    if results:
+        slot_validation=DataValidation(type="list",formula1='"1,2,3"',allow_blank=True)
+        yes_no_validation=DataValidation(type="list",formula1='"정상,무효,실격"',allow_blank=True)
+        outcome_validation=DataValidation(type="list",formula1='"낙찰,미낙찰,판정대기"',allow_blank=True)
+        audit_ws.add_data_validation(slot_validation)
+        audit_ws.add_data_validation(yes_no_validation)
+        audit_ws.add_data_validation(outcome_validation)
+        slot_validation.add(f"J3:J{len(results)+2}")
+        yes_no_validation.add(f"P3:P{len(results)+2}")
+        outcome_validation.add(f"Q3:Q{len(results)+2}")
+        audit_ws.auto_filter.ref=f"A2:U{len(results)+2}"
+    audit_ws.freeze_panes="A3"
+
+    basis_ws=wb.create_sheet("검증기준")
+    basis_ws.sheet_view.showGridLines=False
+    basis_rows=[
+        ("항목","검증값 또는 기준"),
+        ("검증 기준일",AUDIT_SUMMARY["as_of"]),
+        ("판정식",AUDIT_SUMMARY["rule"]),
+        ("최근 1년 판정가능 표본",AUDIT_SUMMARY["recent_1y_evaluable"]),
+        ("최근 1년 가상 낙찰건수",AUDIT_SUMMARY["recent_1y_virtual_wins"]),
+        ("최근 1년 보유업체 전체 가상 낙찰률",AUDIT_SUMMARY["recent_1y_virtual_win_rate"]),
+        ("최근 1년 중심·단일 가상 낙찰률",AUDIT_SUMMARY["recent_1y_center_or_single_rate"]),
+        ("최근 1년 1개사 참여 가상 낙찰률",AUDIT_SUMMARY["recent_1y_single_company_rate"]),
+        ("최근 1년 3개사 참여 가상 낙찰률",AUDIT_SUMMARY["recent_1y_three_company_rate"]),
+        ("추천식 반영 결정",AUDIT_SUMMARY["decision"]),
+        ("해석 주의","가상 낙찰률은 실제 당사 참여기록이 아닌 과거 공고별 반사실적 검증값입니다."),
+        ("입력 안내","사후낙찰검증 시트의 노란색 셀에 개찰 결과와 당사 실제 투찰정보를 입력합니다."),
+    ]
+    for row_idx,(label,value) in enumerate(basis_rows,1):
+        basis_ws.cell(row_idx,1,label)
+        basis_ws.cell(row_idx,2,value)
+        for col in (1,2):
+            cell=basis_ws.cell(row_idx,col)
+            cell.font=Font(name="맑은 고딕",bold=(row_idx==1 or col==1),color="FFFFFFFF" if row_idx==1 else "FF111827")
+            cell.fill=PatternFill("solid",start_color=navy if row_idx==1 else ("FFeef2ff" if col==1 else "FFFFFFFF"))
+            cell.alignment=Alignment(vertical="center",wrap_text=True)
+            cell.border=border
+        if row_idx in (6,7,8,9):
+            basis_ws.cell(row_idx,2).number_format="0.00%"
+    basis_ws.column_dimensions["A"].width=38
+    basis_ws.column_dimensions["B"].width=92
+    basis_ws.freeze_panes="A2"
     buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf
 
 # ════════════════════════════════════════════════════════════════
@@ -1918,7 +2060,7 @@ def make_excel_simple(results, quality=None):
 # ════════════════════════════════════════════════════════════════
 st.markdown("""
 <div class="main-header">
-<h2>📊 투찰전략 분석 시스템 v2.15.5</h2>
+<h2>📊 투찰전략 분석 시스템 v2.15.6</h2>
 <p style="margin:0;opacity:0.8">입찰 참여조건에 따른 최대 3개 업체 추천 사정률·추천기준금액과 산정 근거</p>
 </div>""", unsafe_allow_html=True)
 
@@ -1934,6 +2076,7 @@ with st.sidebar:
         st.success(f"✅ 낙찰이력 {n_c:,}건\n{n_o}개 발주처")
         with st.expander("🔎 낙찰이력 데이터 품질"):
             st.caption(history_quality_warning(quality_info))
+            st.caption(history_period_text(quality_info))
             if int(quality_info.get("electric_region_missing_rows",0))>0:
                 st.warning(
                     "전기공사 지역 누락 행은 동일지역 요소를 제외하고 "
@@ -1943,6 +2086,24 @@ with st.sidebar:
         st.warning("⚠️ 낙찰이력 없음"); df_c_s=None; n_c=0; n_o=0
     if pattern_stats:
         st.success(f"✅ 패턴통계 {len(pattern_stats)}개 발주처")
+    with st.expander("📈 최근 엄격 백테스트 검증"):
+        st.caption(
+            f"기준일 {AUDIT_SUMMARY['as_of']} · 같은 개찰일 결과를 학습에서 제외한 rolling 검증"
+        )
+        st.metric(
+            "최근 1년 보유업체 전체 가상 낙찰",
+            f"{AUDIT_SUMMARY['recent_1y_virtual_win_rate']:.2%}",
+            f"{AUDIT_SUMMARY['recent_1y_virtual_wins']:,}/{AUDIT_SUMMARY['recent_1y_evaluable']:,}건",
+        )
+        st.metric(
+            "최근 1년 중심·단일 1개 값",
+            f"{AUDIT_SUMMARY['recent_1y_center_or_single_rate']:.2%}",
+        )
+        st.caption(AUDIT_SUMMARY["rule"])
+        st.warning(
+            "가상 낙찰률은 과거 공고별 반사실적 검증값이며 실제 당사 낙찰률이 아닙니다. "
+            + AUDIT_SUMMARY["decision"]
+        )
     st.divider()
     st.caption(f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
@@ -1974,6 +2135,7 @@ if mode=="🔧 배포자 관리":
                     c3.metric("평균 사정율",f"{df_v['예가/기초(0%)'].mean():+.4f}%")
                     c4.metric("완전 동일 중복 제거",f"{quality_info.get('exact_duplicates',0):,}건")
                     st.info(history_quality_warning(quality_info))
+                    st.caption(history_period_text(quality_info))
             except Exception as e: st.error(f"오류: {e}")
 
 # ══ 투찰전략 분석 ════════════════════════════════════════════════
