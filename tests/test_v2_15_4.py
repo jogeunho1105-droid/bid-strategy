@@ -187,7 +187,7 @@ class V2154Tests(unittest.TestCase):
         self.assertIn("업체1 최근90일가중치", headers)
         self.assertIn("데이터품질경고", headers)
         self.assertEqual(ws.cell(3, 11).value, 100_100_000)
-        self.assertEqual(ws.cell(3, len(headers)).value, "v2.15.6")
+        self.assertEqual(ws.cell(3, len(headers)).value, self.app["MODEL_VERSION"])
         self.assertEqual(wb.sheetnames, ["업체별 추천", "사후낙찰검증", "검증기준"])
         audit_ws = wb["사후낙찰검증"]
         self.assertEqual(audit_ws.cell(3, 1).value, "N-1")
@@ -198,8 +198,9 @@ class V2154Tests(unittest.TestCase):
         self.assertIn("COUNT(L3,M3,N3)<3", audit_ws.cell(3, 19).value)
         self.assertIn("AND(M3<L3,L3<N3)", audit_ws.cell(3, 19).value)
         basis_ws = wb["검증기준"]
-        self.assertEqual(basis_ws.cell(2, 2).value, "2026-09-01")
-        self.assertEqual(basis_ws.cell(6, 2).value, 0.1423506011)
+        published_summary = self.app["load_audit_summary"]()
+        self.assertEqual(basis_ws.cell(2, 2).value, published_summary["as_of"])
+        self.assertAlmostEqual(basis_ws.cell(6, 2).value, published_summary["recent_1y_virtual_win_rate"], places=12)
 
     def test_quality_summary_includes_history_period(self):
         frame = self.history()
@@ -343,7 +344,7 @@ class V2154Tests(unittest.TestCase):
         self.assertIn("입찰구분: 지역제한", row["입찰판정근거"])
         self.assertIn("참여업체: 3개사", row["입찰판정근거"])
         self.assertIn("기초금액 1억원 이상", row["입찰판정근거"])
-        self.assertEqual(row["모델버전"], "v2.15.6")
+        self.assertEqual(row["모델버전"], self.app["MODEL_VERSION"])
 
 
 if __name__ == "__main__":

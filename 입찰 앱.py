@@ -1,6 +1,6 @@
 # ╔══════════════════════════════════════════════════════════════════╗
-# ║  투찰전략 분석 시스템 v2.15.6                                   ║
-# ║  개선: 엄격 가상낙찰 검증 공개 + 사후 낙찰검증 기록지 추가     ║
+# ║  투찰전략 분석 시스템 v2.15.7                                   ║
+# ║  개선: 6개 모델군 분리 + 전일 이력 공통 추천엔진 적용          ║
 # ║  - 완전 동일 중복 제거 및 데이터 품질 경고                     ║
 # ║  - 업체1·업체3은 헷지 포인트, 업체2는 중심모델로 명확화       ║
 # ║  - 전기공사 단일참여 1순위 추천모델 추가                       ║
@@ -21,6 +21,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from datetime import datetime
+import bid_rules
+import bid_engine
 
 plt.rcParams.update({"font.family": "DejaVu Sans", "axes.unicode_minus": False})
 
@@ -54,8 +56,9 @@ HISTORY_FILE = os.path.join(DATA_DIR, "history.pkl")
 HISTORY_QUALITY_FILE = os.path.join(DATA_DIR, "history_quality.json")
 PATTERN_FILE = os.path.join(DATA_DIR, "pattern_stats.json")
 BUNDLED_PATTERN_FILE = "pattern_stats.json"
-MODEL_VERSION = "v2.15.6"
-AUDIT_SUMMARY = {
+MODEL_VERSION = "v2.15.7"
+PREVIOUS_AUDIT_SUMMARY = {
+    "version": "v2.15.6",
     "as_of": "2026-09-01",
     "source_rows": 56_367,
     "valid_rows": 46_319,
@@ -70,6 +73,30 @@ AUDIT_SUMMARY = {
     "rule": "예가/기초(0%) < 추천사정율 < 1순위사정율(0%)",
     "decision": "일괄 상향보정 후보는 보류검증 신뢰구간이 0을 포함하여 미반영",
 }
+
+
+def load_audit_summary():
+    """Display only a dated published audit; never infer a new success rate."""
+    import bid_engine
+    policy=bid_engine.load_policy()
+    summary=policy.get("summary") or {}
+    if not summary:
+        return dict(PREVIOUS_AUDIT_SUMMARY, previous_version=True)
+    recent=summary.get("recent1y",{})
+    return {
+        "version":policy.get("version",MODEL_VERSION),
+        "as_of":policy.get("as_of","기준일 미확인"),
+        "rule":"예가/기초(0%) < 추천사정율 < 1순위사정율(0%)",
+        "decision":f"보류검증을 통과한 {summary.get('accepted_route_count',0)}개 적용정책; {policy.get('effective_from','적용일 미정')}부터 반영",
+        "recent_1y_total":recent.get("공고수"),
+        "recent_1y_evaluable":recent.get("판정가능"),
+        "recent_1y_virtual_wins":recent.get("가상낙찰"),
+        "recent_1y_virtual_win_rate":recent.get("가상낙찰률"),
+        **summary,
+    }
+
+
+AUDIT_SUMMARY = load_audit_summary()
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # ── 3포인트 전략 DB (분위수 기반, 30,614건 2026-05-13 업데이트) ─
@@ -162,10 +189,17 @@ def load_pattern_stats():
     return {}
 
 def prepare_history_frame(df):
-    """완전 동일 중복만 제거하고 모든 이력을 재현 가능한 순서로 정렬한다."""
+    """학습과 화면이 동일한 유효 이력을 사용하도록 공통 정제를 적용한다."""
+    import bid_engine
     if df is None:
         return None
-    return history_sorted(df.drop_duplicates(keep="first").copy())
+    prepared=bid_engine.prepare_history(df)
+    prepared["예가/기초(0%)"]=prepared["_value"]
+    if "기초금액" in prepared:
+        prepared["기초금액"]=prepared["_base"]
+    if "업체수" in prepared:
+        prepared["업체수"]=prepared["_companies"]
+    return prepared
 
 def history_quality_summary(df):
     """업로드 원본을 기준으로 학습 제외·중복·지역 누락 현황을 계산한다."""
@@ -477,129 +511,34 @@ KEPCO_BUSAN_THREE_COMPANY_BASE_THRESHOLD = 100_000_000
 
 def kepco_local_company_count(org, base):
     """한전 지역제한 감리의 실제 참여 가능 업체 수를 반환한다."""
-    default_count=int(KEPCO_LOCAL_ORGS.get(str(org),KEPCO_NATIONAL_COMPANY_COUNT))
-    try:
-        base_amount=float(base or 0)
-    except (TypeError, ValueError):
-        base_amount=0.0
-    if (
-        str(org)==KEPCO_BUSAN_ULSAN_ORG
-        and base_amount>=KEPCO_BUSAN_THREE_COMPANY_BASE_THRESHOLD
-    ):
-        return 3
-    return default_count
+    import bid_rules
+    return bid_rules.kepco_local_company_count(org,base)
 
 def notice_amount_for_year(year):
     """물품·용역 고시금액. 2021~2026 운영 기준을 2년 단위로 적용한다."""
-    try:
-        y=int(year)
-    except (TypeError, ValueError):
-        y=datetime.now().year
-    if y<=2022:
-        return 210_000_000
-    if y<=2024:
-        return 220_000_000
-    return 230_000_000
+    import bid_rules
+    return bid_rules.notice_amount_for_year(year)
 
 def parse_date_series(series):
     """낙찰이력의 YY.MM.DD와 일반 날짜 형식을 함께 처리한다."""
-    text=series.astype(str).str.strip()
-    parsed=pd.to_datetime(series, errors="coerce")
-    short=text.str.match(r"^\d{2}\.\d{2}\.\d{2}")
-    if short.any():
-        parsed.loc[short]=pd.to_datetime(
-            text.loc[short].str[:8], format="%y.%m.%d", errors="coerce"
-        )
-    return parsed
+    import bid_rules
+    return bid_rules.parse_date_series(series)
 
 def year_from_value(value):
-    if isinstance(value, (datetime, pd.Timestamp)):
-        return int(value.year)
-    s=str(value or "").strip()
-    match4=re.search(r"(20\d{2})", s)
-    if match4:
-        return int(match4.group(1))
-    match2=re.search(r"(?<!\d)(\d{2})[.\-/]", s)
-    if match2:
-        return 2000+int(match2.group(1))
-    return datetime.now().year
+    import bid_rules
+    return bid_rules.year_from_value(value)
 
 def classify_kepco_scope(bid):
     """현재 입찰의 한전 감리 지역·전국 구분과 참여업체 수를 반환한다."""
-    org=str(bid.get("org",""))
-    svc=classify_service(bid.get("name",""), bid.get("industry",""))
-    if not is_kepco(org) or svc!="supervision":
-        return {
-            "applicable":False, "scope":"기존분석", "company_count":3,
-            "year":None, "notice_amount":None, "estimated_price":None,
-            "basis":"한국전력공사 감리 외 용역은 기존 3개사 분석 적용",
-        }
-
-    year=year_from_value(bid.get("deadline"))
-    notice=notice_amount_for_year(year)
-    try:
-        base=float(bid.get("base",0) or 0)
-    except (TypeError, ValueError):
-        base=0.0
-    estimated=base/1.1 if base>0 else None
-    base_limit=int(round(notice*1.1))
-    is_below_notice=base>0 and int(round(base))<base_limit
-
-    if org in KEPCO_LOCAL_ORGS and is_below_notice:
-        scope="지역제한"
-        company_count=kepco_local_company_count(org,base)
-        basis=(
-            f"{year}년 고시금액 {notice/1e8:.1f}억원 미만 "
-            f"(추정가격 {estimated/1e8:.4f}억원)"
-        )
-        if org==KEPCO_BUSAN_ULSAN_ORG:
-            if company_count==3:
-                basis+=("; 기초금액 1억원 이상으로 부산울산본부 참여 3개사")
-            else:
-                basis+=("; 기초금액 1억원 미만으로 부산울산본부 참여 2개사")
-    else:
-        scope="전국입찰"
-        company_count=KEPCO_NATIONAL_COMPANY_COUNT
-        if org not in KEPCO_LOCAL_ORGS:
-            basis="타 지역 지역제한 건은 업로드하지 않는 운영규칙에 따라 전국입찰 처리"
-        elif estimated is None:
-            basis="기초금액 미확인으로 전국입찰 처리"
-        else:
-            basis=(
-                f"{year}년 고시금액 {notice/1e8:.1f}억원 이상 "
-                f"(추정가격 {estimated/1e8:.4f}억원)"
-            )
-        basis+=(
-            f"; 전국입찰 실적 보유 {KEPCO_NATIONAL_COMPANY_COUNT}개사만 참여"
-            " (경북 2개사 제외)"
-        )
-    return {
-        "applicable":True, "scope":scope, "company_count":company_count,
-        "year":year, "notice_amount":notice, "estimated_price":estimated,
-        "basis":basis,
-    }
+    import bid_rules
+    info=bid_rules.classify_kepco_scope(bid)
+    if info.get("scope")=="지역제한" and bid_rules.kepco_branch(bid.get("org"))=="부산울산":
+        info["basis"]+=("; 기초금액 1억원 미만으로 2개사 참여" if info["company_count"]==2 else "; 기초금액 1억원 이상으로 3개사 참여")
+    return info
 
 def classify_service(name, industry=None):
-    s=str(name or "")
-    ind=str(industry or "")
-    su=s.upper()
-    # 전기공사는 감리·설계·진단과 분리한다. 업종이 전기 계열이고 전력감리/전력설계가 아닌 경우 우선 분류한다.
-    is_elec_industry=bool(re.match(r"^전기($|,|\s)", ind))
-    is_service_like=("감리" in s or "설계" in s or "진단" in s or "점검" in s or "측정" in s)
-    if is_elec_industry and "전력감리" not in ind and "전력설계" not in ind and not is_service_like:
-        return "electric_construction"
-    if "전기공사" in s and not is_service_like:
-        return "electric_construction"
-    if "VLF" in su: return "VLF"
-    if "PD" in su or "부분방전" in s: return "PD"
-    if "광학" in s: return "optical"
-    if "콘크리트" in s: return "concrete"
-    if "초음파" in s: return "ultrasound"
-    if "건설사업관리" in s or "감독권한대행" in s: return "construction_management"
-    if "감리" in s: return "supervision"
-    if "설계" in s: return "design"
-    if "진단" in s or "점검" in s or "측정" in s: return "diagnosis_other"
-    return "other"
+    import bid_rules
+    return bid_rules.classify_service(name,industry)
 
 def classify_service_row(row):
     return classify_service(row.get("공고명",""), row.get("업종",""))
@@ -650,10 +589,16 @@ def history_sorted(df):
     return d.reset_index(drop=True)
 
 def enrich_history(df):
+    import bid_rules
     d=history_sorted(df)
     if len(d)==0: return d
     d=d.copy()
     d["_service"]=d.apply(classify_service_row, axis=1) if "공고명" in d.columns else "other"
+    d["_family"]=[bid_rules.classify_model_family(n,i,o) for n,i,o in zip(
+        d.get("공고명",pd.Series("",index=d.index)),
+        d.get("업종",pd.Series("",index=d.index)),
+        d.get("발주기관",pd.Series("",index=d.index)),
+    )]
     d["_amount_bucket"]=d["기초금액"].apply(amount_bucket) if "기초금액" in d.columns else "금액미상"
     d["_company_bucket"]=d["업체수"].apply(company_bucket) if "업체수" in d.columns else None
     date_col=next((c for c in ["개찰일","입찰일","공고일"] if c in d.columns),None)
@@ -661,43 +606,42 @@ def enrich_history(df):
         dates=parse_date_series(d[date_col])
         years=dates.dt.year.fillna(datetime.now().year).astype(int)
     else:
+        dates=pd.Series(pd.NaT,index=d.index,dtype="datetime64[ns]")
         years=pd.Series(datetime.now().year,index=d.index,dtype=int)
+    d["_date"]=dates.dt.normalize()
     d["_bid_year"]=years
     d["_notice_amount"]=years.apply(notice_amount_for_year)
     bases=pd.to_numeric(d["기초금액"],errors="coerce") if "기초금액" in d.columns else pd.Series(np.nan,index=d.index)
     d["_estimated_price"]=bases/1.1
-    base_limits=(d["_notice_amount"]*1.1).round(0)
-    kepco_supervision=(
-        d["발주기관"].astype(str).str.contains("한국전력공사",na=False)
-        & (d["_service"]=="supervision")
-    ) if "발주기관" in d.columns else pd.Series(False,index=d.index)
-    d["_kepco_scope"]="해당없음"
-    d.loc[kepco_supervision,"_kepco_scope"]=np.where(
-        bases.loc[kepco_supervision].round(0)
-        < base_limits.loc[kepco_supervision],
-        "지역제한","전국입찰"
-    )
+    d["_kepco_scope"]=[bid_rules.historical_scope(n,i,o,b,dt) for n,i,o,b,dt in zip(
+        d.get("공고명",pd.Series("",index=d.index)),
+        d.get("업종",pd.Series("",index=d.index)),
+        d.get("발주기관",pd.Series("",index=d.index)),bases,dates,
+    )]
     return d
 
 def classify_bid_scope(bid):
     """한전 감리 입찰범위와 전기공사 단일참여 조건을 통합 분류한다."""
-    if is_electric_construction_bid(bid):
-        return {
-            "applicable":True, "scope":"전기공사 단일참여", "company_count":1,
-            "year":year_from_value(bid.get("deadline")), "notice_amount":None,
-            "estimated_price":None,
-            "basis":"전기공사는 감리·설계·진단과 분리하고, 당사 1개사 참여 기준 단일 1순위 추천값 적용",
-        }
-    return classify_kepco_scope(bid)
+    import bid_rules
+    if classify_service(bid.get("name",""),bid.get("industry",""))=="supervision":
+        return classify_kepco_scope(bid)
+    return bid_rules.classify_bid_scope(bid)
 
 def history_for_bid(bid, df_c, scope_info=None):
-    """한전 감리는 같은 입찰범위만, 그 외 입찰은 기존 전체 이력을 사용한다."""
+    """차트·보조분석에도 현재 공고일 이전의 유효 이력만 허용한다."""
+    import bid_rules
     if df_c is None or len(df_c)==0:
         return df_c
-    info=scope_info or classify_kepco_scope(bid)
+    info=scope_info or classify_bid_scope(bid)
+    d=df_c if "_kepco_scope" in df_c.columns and "_date" in df_c.columns else enrich_history(df_c)
+    bid_date=bid_rules.parse_date_value(bid.get("deadline"))
+    if bid_date is None:
+        return d.iloc[0:0].copy()
+    dates=pd.to_datetime(d["_date"],errors="coerce").dt.normalize()
+    target=pd.to_numeric(d["예가/기초(0%)"],errors="coerce")
+    d=d.loc[dates.notna() & dates.lt(pd.Timestamp(bid_date).normalize()) & target.notna() & target.abs().lt(10)].copy()
     if not info["applicable"]:
-        return df_c
-    d=df_c if "_kepco_scope" in df_c.columns else enrich_history(df_c)
+        return d
     if info.get("scope")=="전기공사 단일참여":
         return d[d["_service"]=="electric_construction"].copy()
     mask=(
@@ -1541,16 +1485,17 @@ def make_flow_chart(a1,a2,a3,lo,hi,org_raw,three_pt=None):
 
 def simple_flow_data(df_c, bid, max_n=20):
     if df_c is None or len(df_c)==0: return None
-    d=df_c if "_service" in df_c.columns else enrich_history(df_c)
+    d=history_for_bid(bid,df_c)
     if len(d)==0 or "예가/기초(0%)" not in d.columns: return None
     org=str(bid.get("org",""))
     svc=classify_service(bid.get("name",""), bid.get("industry",""))
     org_df=d[d["발주기관"].astype(str)==org] if "발주기관" in d.columns else d.iloc[0:0]
-    svc_df=org_df[org_df["_service"]==svc] if "_service" in org_df.columns else d.iloc[0:0]
+    family=model_family_info(bid)[0]
+    svc_df=org_df[(org_df["_service"]==svc)&(org_df["_family"]==family)] if "_service" in org_df.columns else d.iloc[0:0]
     svc_scope="해당 발주처 내 해당분야"
     svc_chart_scope="Same agency service"
     if len(svc_df)<3 and "_service" in d.columns:
-        svc_df=d[d["_service"]==svc]
+        svc_df=d[(d["_service"]==svc)&(d["_family"]==family)]
         svc_scope="전체 발주처 해당분야"
         svc_chart_scope="All agencies service"
     org_vals=org_df["예가/기초(0%)"].dropna().astype(float).tail(max_n).to_list()
@@ -1559,7 +1504,7 @@ def simple_flow_data(df_c, bid, max_n=20):
     return {
         "org_label":"해당 발주처 전체",
         "svc_label":svc_scope,
-        "service_label":SERVICE_LABELS.get(svc,svc),
+        "service_label":model_family_info(bid)[1]+" / "+SERVICE_LABELS.get(svc,svc),
         "org_chart_label":"Agency all",
         "svc_chart_label":svc_chart_scope,
         "service_chart_label":SERVICE_CHART_LABELS.get(svc,svc),
@@ -1616,7 +1561,9 @@ def make_simple_flow_chart(df_c, bid, max_n=20):
 # ── 한전 세분화 함수 ──────────────────────────────────────────
 DIAG_KWS=['광학','초음파','VLF','PD','콘크리트']
 
-def is_kepco(org): return '한국전력공사' in str(org)
+def is_kepco(org):
+    import bid_rules
+    return bid_rules.is_kepco(org)
 def is_diag(name): return any(kw in str(name) for kw in DIAG_KWS)
 def is_supervision(name): return '감리' in str(name)
 
@@ -1843,6 +1790,79 @@ def recommendation_reference_amount(base_amount, rate):
     except (TypeError,ValueError):
         return None
 
+
+def model_family_info(bid):
+    import bid_rules
+    family=bid_rules.classify_model_family(bid.get("name",""),bid.get("industry",""),bid.get("org",""))
+    return family,bid_rules.MODEL_FAMILY_LABELS.get(family,"미분류")
+
+
+def final_recommendation_records(bid, prediction):
+    """Adapt final engine rates for screen/Excel; never apply a second correction."""
+    import bid_engine
+    if prediction is None:
+        return []
+    rates=prediction.get("rates") or []
+    count=int(prediction["scope"]["company_count"])
+    if len(rates)!=count or any(not np.isfinite(float(rate)) for rate in rates):
+        raise ValueError("참여업체 수와 추천값을 확인할 수 없어 추천을 중단했습니다.")
+    family,family_label=model_family_info(bid)
+    strategy=prediction.get("strategy","current")
+    center_index=0 if count==1 else 1
+    replacement_index=(center_index if strategy.endswith("center") else
+                       0 if strategy=="interval_direction" else
+                       2 if strategy=="interval_line" else None)
+    roles=["단일 중심모델"] if count==1 else ["방향성 헷지","중심모델","라인 헷지"][:count]
+    records=[]
+    for index,(rate,role) in enumerate(zip(rates,roles)):
+        is_replacement=index==replacement_index
+        model=(strategy if is_replacement else prediction.get("model","current") if index==center_index
+               else "direction_hedge" if index==0 else "line_hedge")
+        label=(bid_engine.STRATEGY_LABELS.get(strategy,strategy) if is_replacement else
+               MODEL_LABELS.get(model,role) if index==center_index else role)
+        basis=(f"{family_label} / {bid.get('org','')} / 공고일 전일까지만 학습; "
+               f"{label}; {prediction['scope']['basis']}")
+        records.append({
+            "company":f"업체 {index+1}","rate":float(rate),
+            "role":role+(" · 대체분석" if is_replacement else ""),"model":model,"model_label":label,
+            "basis_n":int(prediction.get("prior_rows",0)),"basis":basis,
+            "family":family,"family_label":family_label,
+            "strategy":strategy,"alternative":bool(is_replacement),
+        })
+    return records
+
+
+def predict_final_for_bid(bid, history, policy=None):
+    import bid_engine
+    if history is None or len(history)==0:
+        return None,[]
+    prediction=bid_engine.recommend_bid(bid,history,policy)
+    return prediction,final_recommendation_records(bid,prediction)
+
+
+def predict_final_batch(bids, history, policy=None):
+    """Build one local engine per batch; malformed announcement dates stay blank."""
+    import bid_engine
+    import bid_rules
+    results=[{"prediction":None,"recommendations":[],"error":""} for _ in bids]
+    valid=[]
+    for index,bid in enumerate(bids):
+        if bid_rules.parse_date_value(bid.get("deadline")) is None:
+            results[index]["error"]="투찰마감일을 확인할 수 없어 추천하지 않습니다."
+        else:
+            valid.append(index)
+    if history is None or len(history)==0:
+        for index in valid:
+            results[index]["error"]="추천에 사용할 유효 낙찰이력이 없습니다."
+        return results
+    predictions=bid_engine.recommend_bids([bids[index] for index in valid],history,policy)
+    for index,prediction in zip(valid,predictions):
+        results[index]["prediction"]=prediction
+        results[index]["recommendations"]=final_recommendation_records(bids[index],prediction)
+        if prediction is None:
+            results[index]["error"]="해당 공고일 이전의 유효 낙찰이력이 부족합니다."
+    return results
+
 def recommendation_overlay_fields(rec):
     basis=str((rec or {}).get("basis", ""))
     recent_match=re.search(r"(?:최근 n|최근90일(?:\([^)]*\))? n)=(\d+)",basis)
@@ -1856,10 +1876,12 @@ def recommendation_overlay_fields(rec):
 
 def make_excel_simple(results, quality=None):
     """추천표와 향후 실제 낙찰성과를 누적할 사후검증 기록지를 내보낸다."""
+    audit_summary=load_audit_summary()
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
     from openpyxl.worksheet.datavalidation import DataValidation
+    from openpyxl.formatting.rule import FormulaRule
 
     wb=Workbook(); ws=wb.active; ws.title="업체별 추천"
     ws.sheet_view.showGridLines=False
@@ -1874,12 +1896,12 @@ def make_excel_simple(results, quality=None):
     for pos in range(1,4):
         headers.extend([
             f"업체{pos} 추천사정률(%)",f"업체{pos} 추천기준금액(원)",
-            f"업체{pos} 적용모델",f"업체{pos} 표본수",f"업체{pos} 최근90일표본",
+            f"업체{pos} 적용모델",f"업체{pos} 기초이력수",f"업체{pos} 최근90일표본",
             f"업체{pos} 최근90일변동성",f"업체{pos} 최근90일가중치",f"업체{pos} 산정근거",
         ])
         widths.extend([16,20,22,11,15,17,17,58])
-    headers.extend(["입찰판정근거","데이터품질경고","모델버전"])
-    widths.extend([62,72,13])
+    headers.extend(["입찰판정근거","데이터품질경고","중심모델군","적용전략","모델버전"])
+    widths.extend([62,72,28,28,13])
     ws.merge_cells(start_row=1,start_column=1,end_row=1,end_column=len(headers))
     title=ws.cell(1,1,f"최대 3개 업체 추천 사정률·추천기준금액 — {MODEL_VERSION} / {datetime.now().strftime('%Y.%m.%d')}")
     title.font=Font(name="맑은 고딕",bold=True,size=14,color="FFFFFFFF")
@@ -1915,11 +1937,13 @@ def make_excel_simple(results, quality=None):
                     rec.get("model_label",rec.get("role","")),int(rec.get("basis_n",0) or 0),
                     overlay["recent_n"],overlay["recent_std"],overlay["recent_weight"],rec.get("basis",""),
                 ])
-            elif is_scoped and pos>=company_count:
+            elif pos>=company_count:
                 values.extend(["참여대상 없음",None,"참여대상 없음",None,None,None,None,"참여대상 없음"])
             else:
                 values.extend([None,None,"데이터 부족",None,None,None,None,"데이터 부족"])
         row_warning=history_quality_warning(quality)
+        if row.get("error"):
+            row_warning=row["error"]+"; "+row_warning
         if is_electric_construction_bid(bid) and simple_region(bid.get("region",""))=="지역미상":
             row_warning="전기공사 지역 미상: 지역요소 제외·잔여가중치 재정규화; "+row_warning
         scope_basis=(
@@ -1927,7 +1951,10 @@ def make_excel_simple(results, quality=None):
             f"참여업체: {company_count}개사 / "
             f"적용근거: {scope_info.get('basis','기존 분석 기준')}"
         )
-        values.extend([scope_basis,row_warning,MODEL_VERSION])
+        family,family_label=model_family_info(bid)
+        strategy=row.get("prediction",{}).get("strategy","current") if row.get("prediction") else "current"
+        import bid_engine
+        values.extend([scope_basis,row_warning,family_label,bid_engine.STRATEGY_LABELS.get(strategy,strategy),MODEL_VERSION])
         for col,value in enumerate(values,1):
             cell=ws.cell(idx,col,value)
             cell.font=Font(name="맑은 고딕",size=9)
@@ -2002,12 +2029,12 @@ def make_excel_simple(results, quality=None):
         audit_ws.cell(
             idx,18,
             f'=IF(COUNT(K{idx},M{idx},N{idx})<3,"판정불가",'
-            f'IF(N{idx}<=M{idx},"판정불가",IF(AND(M{idx}<K{idx},K{idx}<N{idx}),"가상낙찰","미낙찰")))',
+            f'IF(AND(M{idx}<K{idx},K{idx}<N{idx}),"가상낙찰","미낙찰"))',
         )
         audit_ws.cell(
             idx,19,
             f'=IF(COUNT(L{idx},M{idx},N{idx})<3,"판정불가",'
-            f'IF(N{idx}<=M{idx},"판정불가",IF(AND(M{idx}<L{idx},L{idx}<N{idx}),"가상낙찰","미낙찰")))',
+            f'IF(AND(M{idx}<L{idx},L{idx}<N{idx}),"가상낙찰","미낙찰"))',
         )
         audit_ws.row_dimensions[idx].height=48
     if results:
@@ -2021,21 +2048,28 @@ def make_excel_simple(results, quality=None):
         yes_no_validation.add(f"P3:P{len(results)+2}")
         outcome_validation.add(f"Q3:Q{len(results)+2}")
         audit_ws.auto_filter.ref=f"A2:U{len(results)+2}"
+        audit_ws.conditional_formatting.add(
+            f"N3:N{len(results)+2}",
+            FormulaRule(formula=['AND(COUNT(M3,N3)=2,N3<M3)'],fill=PatternFill("solid",start_color="FFFFC000")),
+        )
     audit_ws.freeze_panes="A3"
 
     basis_ws=wb.create_sheet("검증기준")
     basis_ws.sheet_view.showGridLines=False
     basis_rows=[
         ("항목","검증값 또는 기준"),
-        ("검증 기준일",AUDIT_SUMMARY["as_of"]),
-        ("판정식",AUDIT_SUMMARY["rule"]),
-        ("최근 1년 판정가능 표본",AUDIT_SUMMARY["recent_1y_evaluable"]),
-        ("최근 1년 가상 낙찰건수",AUDIT_SUMMARY["recent_1y_virtual_wins"]),
-        ("최근 1년 보유업체 전체 가상 낙찰률",AUDIT_SUMMARY["recent_1y_virtual_win_rate"]),
-        ("최근 1년 중심·단일 가상 낙찰률",AUDIT_SUMMARY["recent_1y_center_or_single_rate"]),
-        ("최근 1년 1개사 참여 가상 낙찰률",AUDIT_SUMMARY["recent_1y_single_company_rate"]),
-        ("최근 1년 3개사 참여 가상 낙찰률",AUDIT_SUMMARY["recent_1y_three_company_rate"]),
-        ("추천식 반영 결정",AUDIT_SUMMARY["decision"]),
+        ("검증 기준일",audit_summary.get("as_of")),
+        ("판정식",audit_summary["rule"]),
+        ("최근 1년 판정가능 표본",audit_summary.get("recent_1y_evaluable")),
+        ("최근 1년 가상 낙찰건수",audit_summary.get("recent_1y_virtual_wins")),
+        ("최근 1년 보유업체 전체 가상 낙찰률",audit_summary.get("recent_1y_virtual_win_rate")),
+        ("최근 1년 중심·단일 가상 낙찰률",audit_summary.get("recent_1y_center_or_single_rate","별도 미산정")),
+        ("최근 1년 1개사 참여 가상 낙찰률",audit_summary.get("recent_1y_single_company_rate","별도 미산정")),
+        ("최근 1년 3개사 참여 가상 낙찰률",audit_summary.get("recent_1y_three_company_rate","별도 미산정")),
+        ("추천식 반영 결정",audit_summary["decision"]),
+        ("검증 모델버전",audit_summary.get("version","미확인")+(" (이전 버전 검증)" if audit_summary.get("previous_version") else "")),
+        ("검증기간·분모","최근 1년 / 참여가능 공고 중 결과값 판정가능 공고. 양수구간이 없는 공고도 실패로 포함합니다." if not audit_summary.get("previous_version") else "이전 v2.15.6 검증 기준이며 현재 모델 성능으로 해석하지 않습니다."),
+        ("동일·역전 구간 판정","결과가 숫자이면 1순위 사정율 ≤ 예가/기초인 경우도 미낙찰로 계산합니다. 역전 구간은 사후낙찰검증의 1순위 사정율 셀을 주황색으로 표시하여 원본 확인 대상으로 구분합니다."),
         ("해석 주의","가상 낙찰률은 실제 당사 참여기록이 아닌 과거 공고별 반사실적 검증값입니다."),
         ("입력 안내","사후낙찰검증 시트의 노란색 셀에 개찰 결과와 당사 실제 투찰정보를 입력합니다."),
     ]
@@ -2060,7 +2094,7 @@ def make_excel_simple(results, quality=None):
 # ════════════════════════════════════════════════════════════════
 st.markdown("""
 <div class="main-header">
-<h2>📊 투찰전략 분석 시스템 v2.15.6</h2>
+<h2>📊 투찰전략 분석 시스템 v2.15.7</h2>
 <p style="margin:0;opacity:0.8">입찰 참여조건에 따른 최대 3개 업체 추천 사정률·추천기준금액과 산정 근거</p>
 </div>""", unsafe_allow_html=True)
 
@@ -2088,17 +2122,17 @@ with st.sidebar:
         st.success(f"✅ 패턴통계 {len(pattern_stats)}개 발주처")
     with st.expander("📈 최근 엄격 백테스트 검증"):
         st.caption(
-            f"기준일 {AUDIT_SUMMARY['as_of']} · 같은 개찰일 결과를 학습에서 제외한 rolling 검증"
+            f"{'이전 버전 검증 · ' if AUDIT_SUMMARY.get('previous_version') else ''}"
+            f"{AUDIT_SUMMARY.get('version',MODEL_VERSION)} / 기준일 {AUDIT_SUMMARY.get('as_of','미확인')} · 같은 개찰일 결과를 학습에서 제외한 rolling 검증"
         )
-        st.metric(
-            "최근 1년 보유업체 전체 가상 낙찰",
-            f"{AUDIT_SUMMARY['recent_1y_virtual_win_rate']:.2%}",
-            f"{AUDIT_SUMMARY['recent_1y_virtual_wins']:,}/{AUDIT_SUMMARY['recent_1y_evaluable']:,}건",
-        )
-        st.metric(
-            "최근 1년 중심·단일 1개 값",
-            f"{AUDIT_SUMMARY['recent_1y_center_or_single_rate']:.2%}",
-        )
+        if AUDIT_SUMMARY.get("recent_1y_virtual_win_rate") is not None:
+            st.metric(
+                "최근 1년 보유업체 전체 가상 낙찰",
+                f"{AUDIT_SUMMARY['recent_1y_virtual_win_rate']:.2%}",
+                f"{AUDIT_SUMMARY.get('recent_1y_virtual_wins',0):,}/{AUDIT_SUMMARY.get('recent_1y_evaluable',0):,}건",
+            )
+        if AUDIT_SUMMARY.get("recent_1y_center_or_single_rate") is not None:
+            st.metric("최근 1년 중심·단일 1개 값",f"{AUDIT_SUMMARY['recent_1y_center_or_single_rate']:.2%}")
         st.caption(AUDIT_SUMMARY["rule"])
         st.warning(
             "가상 낙찰률은 과거 공고별 반사실적 검증값이며 실제 당사 낙찰률이 아닙니다. "
@@ -2120,7 +2154,7 @@ if mode=="🔧 배포자 관리":
             try:
                 content=uploaded.read()
                 df_new=pd.read_excel(io.BytesIO(content))
-                required=["발주기관","공고명","기초금액","예가/기초(0%)"]
+                required=["개찰일","발주기관","공고명","기초금액","예가/기초(0%)"]
                 missing=[c for c in required if c not in df_new.columns]
                 if missing: st.error(f"필수 컬럼 없음: {missing}")
                 else:
@@ -2159,7 +2193,9 @@ else:
         2️⃣ <b>업체 2:</b> 중심모델 — 백테스트 최적모델 + 최근90일 보수 오버레이<br>
         3️⃣ <b>업체 3:</b> 라인 헷지 — 0.02 라인 + 직전 패턴 최다빈도<br><br>
         <b>정렬:</b> 개찰일 → 공고번호 → 번호 안정 정렬(동일일 재현성 고정)<br>
-        <b>참여:</b> 부산울산 지역제한 감리 1억원 이상 3개사·미만 2개사 · 한전 전국 감리 3개사 · 전기공사 1개사<br>
+        <b>참여:</b> 부산울산 지역제한 감리 1억원 이상 3개사·미만 2개사 · 경북·대구 지역제한 감리 1개사 · 한전 전국 감리 3개사 · 한전 VLF진단 1억원 이상 3개사·미만 2개사 · 기타진단 3개사 · 전기공사 1개사<br>
+        <b>모델군:</b> 일반 건설사업관리·일반진단·설계·일반감리·한전감리·공동주택 및 주거시설 감리<br>
+        <b>대체분석:</b> 발주기관·모델군별 보류검증을 통과한 경우 해당 추천방법에 적용<br>
         <b>데이터:</b> {nc:,}건 | {no}개 발주처
         </div>""",unsafe_allow_html=True)
     if quality_info:
@@ -2199,26 +2235,19 @@ else:
     results=[]
     df_model=enrich_history(df_c) if df_c is not None else None
     with st.spinner(f"분석 중... ({len(bids)}건)"):
-        for b in bids:
+        try:
+            batch_predictions=predict_final_batch(bids,df_c)
+        except ValueError as exc:
+            st.error(f"추천 계산을 진행할 수 없습니다: {exc}")
+            st.stop()
+        for b,batch_result in zip(bids,batch_predictions):
             scope_info=classify_bid_scope(b)
-            df_bid=history_for_bid(b,df_model,scope_info)
-            scoped_pattern_stats={} if scope_info["applicable"] else pattern_stats
-            a1=analyze_pattern(b["org"],df_bid,scoped_pattern_stats)
-            a2=analyze_similar(b["name"],b["base"],df_bid)
-            a3=analyze_trend(b["org"],df_bid)
-            im=analyze_improved_model(b,df_bid)
-            recommendations=apply_company_count(
-                build_company_recommendations(b,im,a1,a2,a3,df_bid),
-                scope_info,
-                df_bid,
-                b,
-            )
             amt_lbl,amt_adj,amt_note=get_amt_info(b["base_억"])
-            results.append({"bid":b,"a1":a1,"a2":a2,"a3":a3,
-                            "improved":im,
+            results.append({"bid":b,"a1":None,"a2":None,"a3":None,
+                            "improved":None,
                             "scope_info":scope_info,
                             "amt_lbl":amt_lbl,"amt_adj":amt_adj,"amt_note":amt_note,
-                            "recommendations":recommendations})
+                            **batch_result})
 
     # ── 요약 테이블: 최종 추천값과 근거만 표시 ───────────────
     st.subheader(f"📋 최대 3개 업체 추천 사정률·추천기준금액 — {datetime.now().strftime('%Y.%m.%d')} ({len(bids)}건)")
@@ -2231,7 +2260,9 @@ else:
         vals=[f"{r['rate']:+.4f}%" for r in recs]
         bases=[r["basis"] for r in recs]
         notes=[]
-        if is_scoped:
+        if row.get("error"):
+            notes.append(row["error"])
+        if scope_info:
             notes.append(
                 f"입찰구분: {scope_info['scope']} / 참여 {company_count}개사 / "
                 f"{scope_info['basis']}"
@@ -2239,13 +2270,13 @@ else:
         for i in range(3):
             if i<len(bases):
                 notes.append(f"업체{i+1}: {bases[i]}")
-            elif is_scoped and i>=company_count:
+            elif i>=company_count:
                 notes.append(f"업체{i+1}: 참여대상 없음")
             else:
                 notes.append(f"업체{i+1}: 데이터 부족")
         display_vals=[
             vals[i] if i<len(vals)
-            else "참여대상 없음" if is_scoped and i>=company_count
+            else "참여대상 없음" if i>=company_count
             else "없음"
             for i in range(3)
         ]
@@ -2253,13 +2284,14 @@ else:
             (
                 f"{recommendation_reference_amount(b.get('base',0),recs[i]['rate']):,}원"
                 if i<len(recs) and recommendation_reference_amount(b.get('base',0),recs[i]['rate']) is not None
-                else "참여대상 없음" if is_scoped and i>=company_count
+                else "참여대상 없음" if i>=company_count
                 else "없음"
             )
             for i in range(3)
         ]
         rows.append({
             "공고명":b["name"][:40]+"…" if len(b["name"])>40 else b["name"],
+            "중심모델군":model_family_info(b)[1],
             "업체1추천":display_vals[0],
             "업체1추천기준금액":display_amounts[0],
             "업체2추천":display_vals[1],
@@ -2284,17 +2316,20 @@ else:
         scope_info=row.get("scope_info") or {}
         scope_label=(
             f"  |  {scope_info['scope']} {scope_info['company_count']}개사"
-            if scope_info.get("applicable") else ""
+            if scope_info else ""
         )
         label=(f"No.{b['no']}  {b['name'][:48]}  |  "
                f"{b['org'].replace('한국전력공사 ','한전 ')}  |  "
                f"{b['base_억']:.4f}억  |  {b['deadline']}{scope_label}")
         with st.expander(label):
-            if scope_info.get("applicable"):
+            st.caption("중심모델군: "+model_family_info(b)[1]+" / 세부업종: "+SERVICE_LABELS.get(classify_service(b.get("name",""),b.get("industry","")),"기타"))
+            if scope_info:
                 st.info(
                     f"{scope_info['scope']} · 참여 {scope_info['company_count']}개사 · "
                     f"{scope_info['basis']}"
                 )
+            if scope_info.get("scope_assumed"):
+                st.warning("입찰범위·참여업체 수에 운영 가정이 포함되어 있습니다. 공고의 지역제한 및 당사 참가자격을 확인한 후 적용하세요. "+scope_info.get("basis",""))
             if is_electric_construction_bid(b) and simple_region(b.get("region",""))=="지역미상":
                 st.warning("지역 정보가 없어 동일지역 요소를 제외하고 나머지 가중치를 재정규화했습니다.")
             if recs:
@@ -2313,10 +2348,10 @@ else:
                         )
                         st.caption(
                             f"적용 모델: {rec.get('model_label',rec.get('role','-'))} · "
-                            f"표본 {int(rec.get('basis_n',0) or 0):,}건 · 산정 근거: {rec['basis']}"
+                            f"기초 이력 {int(rec.get('basis_n',0) or 0):,}건 · 산정 근거: {rec['basis']}"
                         )
             else:
-                st.warning("추천값을 계산할 낙찰이력이 부족합니다.")
+                st.warning(row.get("error") or "추천값을 계산할 낙찰이력이 부족합니다.")
 
             # ── 사정율 흐름 차트: 발주처 전체 vs 해당분야 ───────
             st.markdown("---")
