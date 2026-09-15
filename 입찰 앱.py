@@ -1,5 +1,5 @@
 # ╔══════════════════════════════════════════════════════════════════╗
-# ║  투찰전략 분석 시스템 v2.15.7                                   ║
+# ║  투찰전략 분석 시스템 v2.15.8                                   ║
 # ║  개선: 6개 모델군 분리 + 전일 이력 공통 추천엔진 적용          ║
 # ║  - 완전 동일 중복 제거 및 데이터 품질 경고                     ║
 # ║  - 업체1·업체3은 헷지 포인트, 업체2는 중심모델로 명확화       ║
@@ -56,7 +56,7 @@ HISTORY_FILE = os.path.join(DATA_DIR, "history.pkl")
 HISTORY_QUALITY_FILE = os.path.join(DATA_DIR, "history_quality.json")
 PATTERN_FILE = os.path.join(DATA_DIR, "pattern_stats.json")
 BUNDLED_PATTERN_FILE = "pattern_stats.json"
-MODEL_VERSION = "v2.15.7"
+MODEL_VERSION = "v2.15.8"
 PREVIOUS_AUDIT_SUMMARY = {
     "version": "v2.15.6",
     "as_of": "2026-09-01",
@@ -2094,7 +2094,7 @@ def make_excel_simple(results, quality=None):
 # ════════════════════════════════════════════════════════════════
 st.markdown("""
 <div class="main-header">
-<h2>📊 투찰전략 분석 시스템 v2.15.7</h2>
+<h2>📊 투찰전략 분석 시스템 v2.15.8</h2>
 <p style="margin:0;opacity:0.8">입찰 참여조건에 따른 최대 3개 업체 추천 사정률·추천기준금액과 산정 근거</p>
 </div>""", unsafe_allow_html=True)
 
@@ -2250,7 +2250,7 @@ else:
                             **batch_result})
 
     # ── 요약 테이블: 최종 추천값과 근거만 표시 ───────────────
-    st.subheader(f"📋 최대 3개 업체 추천 사정률·추천기준금액 — {datetime.now().strftime('%Y.%m.%d')} ({len(bids)}건)")
+    st.subheader(f"📋 최대 3개 업체 추천 사정률 — {datetime.now().strftime('%Y.%m.%d')} ({len(bids)}건)")
     rows=[]
     for row in results:
         b=row["bid"]; recs=row.get("recommendations") or []
@@ -2280,27 +2280,23 @@ else:
             else "없음"
             for i in range(3)
         ]
-        display_amounts=[
-            (
-                f"{recommendation_reference_amount(b.get('base',0),recs[i]['rate']):,}원"
-                if i<len(recs) and recommendation_reference_amount(b.get('base',0),recs[i]['rate']) is not None
-                else "참여대상 없음" if i>=company_count
-                else "없음"
-            )
-            for i in range(3)
-        ]
         rows.append({
-            "공고명":b["name"][:40]+"…" if len(b["name"])>40 else b["name"],
             "중심모델군":model_family_info(b)[1],
+            "공고명":b["name"][:40]+"…" if len(b["name"])>40 else b["name"],
             "업체1추천":display_vals[0],
-            "업체1추천기준금액":display_amounts[0],
             "업체2추천":display_vals[1],
-            "업체2추천기준금액":display_amounts[1],
             "업체3추천":display_vals[2],
-            "업체3추천기준금액":display_amounts[2],
             "비고":"\n".join(notes)
         })
-    summary_df=pd.DataFrame(rows)
+    summary_columns=[
+        "중심모델군",
+        "공고명",
+        "업체1추천",
+        "업체2추천",
+        "업체3추천",
+        "비고",
+    ]
+    summary_df=pd.DataFrame(rows, columns=summary_columns)
     st.dataframe(
         summary_df,
         use_container_width=True,
