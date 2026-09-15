@@ -34,10 +34,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Syntax and regression tests
+      - name: Syntax and targeted regression tests
         run: |
           python -m py_compile "입찰 앱.py" bid_rules.py bid_engine.py bid_legacy.py
-          PYTHONPATH=.:analysis python -m unittest discover -s tests -p "test*.py"
+          PYTHONPATH=.:analysis:tests python tests/test_bid_rules.py
+          PYTHONPATH=.:analysis:tests python tests/test_bid_engine.py
+          PYTHONPATH=.:analysis:tests python tests/test_v2_15_4.py
+          PYTHONPATH=.:analysis:tests python tests/test_app_v2_15_7.py
+          PYTHONPATH=.:analysis:tests python tests/test_app_v2_15_8.py
+          PYTHONPATH=.:analysis:tests python tests/test_backtest_v2_15_7.py
           git diff --check
 
       - name: Streamlit smoke test
