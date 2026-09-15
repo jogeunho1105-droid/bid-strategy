@@ -37,7 +37,7 @@ jobs:
       - name: Syntax and regression tests
         run: |
           python -m py_compile "입찰 앱.py" bid_rules.py bid_engine.py bid_legacy.py
-          python -m unittest discover -s tests -p "test*.py"
+          PYTHONPATH=.:analysis python -m unittest discover -s tests -p "test*.py"
           git diff --check
 
       - name: Streamlit smoke test
