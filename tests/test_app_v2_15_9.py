@@ -59,7 +59,7 @@ class StrategySummaryV2159Tests(unittest.TestCase):
 
     def test_download_button_and_version_present(self):
         app_text=(Path(__file__).resolve().parents[1]/"입찰 앱.py").read_text(encoding="utf-8")
-        self.assertIn('MODEL_VERSION = "v2.15.9"',app_text)
+        self.assertIn('MODEL_VERSION = "v2.15.10"',app_text)
         self.assertIn("📥 투찰전략 요약 다운로드",app_text)
         self.assertIn("투찰전략_요약_",app_text)
 

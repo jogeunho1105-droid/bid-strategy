@@ -90,7 +90,7 @@ class AppSharedEngineTests(unittest.TestCase):
         self.assertEqual(values["중심모델군"],"일반진단")
         self.assertEqual(values["용역분류"],"VLF")
         self.assertEqual(values["업체3 추천사정률(%)"],"참여대상 없음")
-        self.assertEqual(values["모델버전"],"v2.15.9")
+        self.assertEqual(values["모델버전"],"v2.15.10")
         self.assertEqual(workbook["사후낙찰검증"].cell(3,8).value,None)
         self.assertIn("AND(M3<K3,K3<N3)",workbook["사후낙찰검증"].cell(3,18).value)
         self.assertNotIn("N3<=M3",workbook["사후낙찰검증"].cell(3,18).value)

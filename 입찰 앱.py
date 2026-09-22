@@ -1,5 +1,5 @@
 # ╔══════════════════════════════════════════════════════════════════╗
-# ║  투찰전략 분석 시스템 v2.15.9                                   ║
+# ║  투찰전략 분석 시스템 v2.15.10                                  ║
 # ║  개선: 6개 모델군 분리 + 전일 이력 공통 추천엔진 적용          ║
 # ║  - 완전 동일 중복 제거 및 데이터 품질 경고                     ║
 # ║  - 업체1·업체3은 헷지 포인트, 업체2는 중심모델로 명확화       ║
@@ -56,7 +56,7 @@ HISTORY_FILE = os.path.join(DATA_DIR, "history.pkl")
 HISTORY_QUALITY_FILE = os.path.join(DATA_DIR, "history_quality.json")
 PATTERN_FILE = os.path.join(DATA_DIR, "pattern_stats.json")
 BUNDLED_PATTERN_FILE = "pattern_stats.json"
-MODEL_VERSION = "v2.15.9"
+MODEL_VERSION = "v2.15.10"
 PREVIOUS_AUDIT_SUMMARY = {
     "version": "v2.15.6",
     "as_of": "2026-09-01",
@@ -2192,7 +2192,7 @@ def make_strategy_summary_excel(results):
 # ════════════════════════════════════════════════════════════════
 st.markdown("""
 <div class="main-header">
-<h2>📊 투찰전략 분석 시스템 v2.15.9</h2>
+<h2>📊 투찰전략 분석 시스템 v2.15.10</h2>
 <p style="margin:0;opacity:0.8">입찰 참여조건에 따른 최대 3개 업체 추천 사정률·추천기준금액과 산정 근거</p>
 </div>""", unsafe_allow_html=True)
 
@@ -2381,6 +2381,7 @@ else:
         rows.append({
             "중심모델군":model_family_info(b)[1],
             "공고명":b["name"][:40]+"…" if len(b["name"])>40 else b["name"],
+            "낙찰하한율":format_lower_limit_rate(b.get("lower_limit_rate")),
             "업체1추천":display_vals[0],
             "업체2추천":display_vals[1],
             "업체3추천":display_vals[2],
@@ -2389,6 +2390,7 @@ else:
     summary_columns=[
         "중심모델군",
         "공고명",
+        "낙찰하한율",
         "업체1추천",
         "업체2추천",
         "업체3추천",
