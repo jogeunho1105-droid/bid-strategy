@@ -37,7 +37,7 @@ jobs:
       - name: Syntax and targeted regression tests
         run: |
           python -m py_compile "입찰 앱.py" bid_rules.py bid_engine.py bid_legacy.py
-          PYTHONPATH=.:analysis python -m unittest \
+          PYTHONPATH=.:analysis:tests python -m unittest \
             tests.test_bid_rules \
             tests.test_bid_engine \
             tests.test_app_v2_15_7 \
