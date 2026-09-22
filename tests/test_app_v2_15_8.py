@@ -11,9 +11,9 @@ DETAIL = APP.split("# ── 건별 상세", 1)[1]
 
 class SummaryLayoutV2158Tests(unittest.TestCase):
     def test_version_updated(self):
-        self.assertIn('MODEL_VERSION = "v2.15.8"', APP)
-        self.assertIn("투찰전략 분석 시스템 v2.15.8", APP)
-        self.assertTrue(README.startswith("# 투찰전략 분석 시스템 v2.15.8"))
+        self.assertIn('MODEL_VERSION = "v2.15.9"', APP)
+        self.assertIn("투찰전략 분석 시스템 v2.15.9", APP)
+        self.assertTrue(README.startswith("# 투찰전략 분석 시스템 v2.15.9"))
 
     def test_summary_title_and_columns(self):
         self.assertIn("최대 3개 업체 추천 사정률 —", SUMMARY)

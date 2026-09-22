@@ -1,5 +1,5 @@
 # ╔══════════════════════════════════════════════════════════════════╗
-# ║  투찰전략 분석 시스템 v2.15.8                                   ║
+# ║  투찰전략 분석 시스템 v2.15.9                                   ║
 # ║  개선: 6개 모델군 분리 + 전일 이력 공통 추천엔진 적용          ║
 # ║  - 완전 동일 중복 제거 및 데이터 품질 경고                     ║
 # ║  - 업체1·업체3은 헷지 포인트, 업체2는 중심모델로 명확화       ║
@@ -56,7 +56,7 @@ HISTORY_FILE = os.path.join(DATA_DIR, "history.pkl")
 HISTORY_QUALITY_FILE = os.path.join(DATA_DIR, "history_quality.json")
 PATTERN_FILE = os.path.join(DATA_DIR, "pattern_stats.json")
 BUNDLED_PATTERN_FILE = "pattern_stats.json"
-MODEL_VERSION = "v2.15.8"
+MODEL_VERSION = "v2.15.9"
 PREVIOUS_AUDIT_SUMMARY = {
     "version": "v2.15.6",
     "as_of": "2026-09-01",
@@ -1254,6 +1254,33 @@ def apply_company_count(recommendations, scope_info, df_bid=None, bid=None):
         result.append(item)
     return result
 
+def parse_lower_limit_rate(value):
+    """입찰서류함 낙찰하한율을 퍼센트 숫자(예: 89.745)로 정규화한다."""
+    if value is None:
+        return None
+    try:
+        if isinstance(value, str):
+            text=value.strip().replace(",", "")
+            if not text:
+                return None
+            had_percent="%" in text
+            text=text.replace("%", "").strip()
+            number=float(text)
+            if not had_percent and 0 < abs(number) <= 1:
+                number*=100
+        else:
+            number=float(value)
+            if not np.isfinite(number):
+                return None
+            if 0 < abs(number) <= 1:
+                number*=100
+        if not np.isfinite(number) or number <= 0 or number > 100:
+            return None
+        return round(float(number),6)
+    except (TypeError,ValueError):
+        return None
+
+
 def parse_xls(file_bytes, filename=""):
     """입찰서류함 파일 파싱 — xls/xlsx 모두 지원"""
     bids = []
@@ -1294,6 +1321,7 @@ def parse_xls(file_bytes, filename=""):
                 "region":   str(row.get("지역") or ""),
                 "industry": str(row.get("업종") or row.get("참가가능업종") or ""),
                 "companies": row.get("업체수") or row.get("참가업체수") or None,
+                "lower_limit_rate": parse_lower_limit_rate(row.get("낙찰하한율")),
             })
     else:
         # ── xls 형식 (나라장터 기본) ──────────────────────────
@@ -1316,6 +1344,7 @@ def parse_xls(file_bytes, filename=""):
                 "region":   row.get("지역", ""),
                 "industry": row.get("업종", row.get("참가가능업종", "")),
                 "companies": row.get("업체수", row.get("참가업체수", None)),
+                "lower_limit_rate": parse_lower_limit_rate(row.get("낙찰하한율")),
             })
     return bids
 
@@ -2089,12 +2118,81 @@ def make_excel_simple(results, quality=None):
     basis_ws.freeze_panes="A2"
     buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf
 
+def format_lower_limit_rate(value):
+    rate=parse_lower_limit_rate(value)
+    if rate is None:
+        return "미확인"
+    return f"{rate:.6f}".rstrip("0").rstrip(".")+"%"
+
+
+def make_strategy_summary_excel(results):
+    """공고명·낙찰하한율·업체1~3 최종 추천만 포함한 요약 Excel."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    wb=Workbook(); ws=wb.active; ws.title="투찰전략"
+    ws.sheet_view.showGridLines=False
+    navy="FF1a2744"; light="FFf8fafc"
+    thin=Side(style="thin",color="FFd1d5db")
+    border=Border(left=thin,right=thin,top=thin,bottom=thin)
+    headers=["공고명","낙찰하한율","업체1추천","업체2추천","업체3추천"]
+    widths=[60,15,15,15,15]
+
+    ws.merge_cells("A1:E1")
+    title=ws["A1"]
+    title.value=f"투찰전략 분석 — {MODEL_VERSION} / {datetime.now().strftime('%Y.%m.%d')}"
+    title.font=Font(name="맑은 고딕",bold=True,size=14,color="FFFFFFFF")
+    title.fill=PatternFill("solid",start_color=navy)
+    title.alignment=Alignment(horizontal="center",vertical="center")
+    ws.row_dimensions[1].height=30
+
+    for col,(header,width) in enumerate(zip(headers,widths),1):
+        cell=ws.cell(2,col,header)
+        cell.font=Font(name="맑은 고딕",bold=True,color="FFFFFFFF")
+        cell.fill=PatternFill("solid",start_color=navy)
+        cell.alignment=Alignment(horizontal="center",vertical="center",wrap_text=True)
+        cell.border=border
+        ws.column_dimensions[get_column_letter(col)].width=width
+    ws.row_dimensions[2].height=26
+
+    for row_idx,row in enumerate(results,3):
+        bid=row.get("bid") or {}
+        recs=row.get("recommendations") or []
+        scope_info=row.get("scope_info") or {}
+        company_count=int(scope_info.get("company_count",len(recs) or 3))
+        values=[str(bid.get("name") or ""),format_lower_limit_rate(bid.get("lower_limit_rate"))]
+        for pos in range(3):
+            if pos < len(recs):
+                values.append(f"{float(recs[pos]['rate']):+.4f}%")
+            elif pos >= company_count:
+                values.append("참여대상 없음")
+            else:
+                values.append("없음")
+        for col,value in enumerate(values,1):
+            cell=ws.cell(row_idx,col,value)
+            cell.font=Font(name="맑은 고딕",size=10)
+            cell.fill=PatternFill("solid",start_color=light if row_idx%2==0 else "FFFFFFFF")
+            cell.alignment=Alignment(
+                horizontal="left" if col==1 else "center",
+                vertical="center",
+                wrap_text=(col==1),
+            )
+            cell.border=border
+        ws.row_dimensions[row_idx].height=32
+
+    last_row=max(2,len(results)+2)
+    ws.auto_filter.ref=f"A2:E{last_row}"
+    ws.freeze_panes="A3"
+    buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+
+
 # ════════════════════════════════════════════════════════════════
 #  메인 UI
 # ════════════════════════════════════════════════════════════════
 st.markdown("""
 <div class="main-header">
-<h2>📊 투찰전략 분석 시스템 v2.15.8</h2>
+<h2>📊 투찰전략 분석 시스템 v2.15.9</h2>
 <p style="margin:0;opacity:0.8">입찰 참여조건에 따른 최대 3개 업체 추천 사정률·추천기준금액과 산정 근거</p>
 </div>""", unsafe_allow_html=True)
 
@@ -2384,3 +2482,9 @@ else:
         file_name=f"투찰전략_{today_str}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",use_container_width=True)
+    summary_excel_buf=make_strategy_summary_excel(results)
+    st.download_button("📥 투찰전략 요약 다운로드",
+        data=summary_excel_buf,
+        file_name=f"투찰전략_요약_{today_str}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True)
