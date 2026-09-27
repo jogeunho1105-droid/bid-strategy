@@ -1,5 +1,5 @@
 # ╔══════════════════════════════════════════════════════════════════╗
-# ║  투찰전략 분석 시스템 v2.15.10                                  ║
+# ║  투찰전략 분석 시스템 v2.15.11                                  ║
 # ║  개선: 6개 모델군 분리 + 전일 이력 공통 추천엔진 적용          ║
 # ║  - 완전 동일 중복 제거 및 데이터 품질 경고                     ║
 # ║  - 업체1·업체3은 헷지 포인트, 업체2는 중심모델로 명확화       ║
@@ -23,6 +23,7 @@ import matplotlib.patches as mpatches
 from datetime import datetime
 import bid_rules
 import bid_engine
+import bid_strategies
 
 plt.rcParams.update({"font.family": "DejaVu Sans", "axes.unicode_minus": False})
 
@@ -56,7 +57,7 @@ HISTORY_FILE = os.path.join(DATA_DIR, "history.pkl")
 HISTORY_QUALITY_FILE = os.path.join(DATA_DIR, "history_quality.json")
 PATTERN_FILE = os.path.join(DATA_DIR, "pattern_stats.json")
 BUNDLED_PATTERN_FILE = "pattern_stats.json"
-MODEL_VERSION = "v2.15.10"
+MODEL_VERSION = "v2.15.11"
 PREVIOUS_AUDIT_SUMMARY = {
     "version": "v2.15.6",
     "as_of": "2026-09-01",
@@ -1828,6 +1829,9 @@ def model_family_info(bid):
 
 def final_recommendation_records(bid, prediction):
     """Adapt final engine rates for screen/Excel; never apply a second correction."""
+    if prediction is not None and "selected_strategy" in prediction:
+        import bid_strategies
+        return bid_strategies.recommendation_records(bid,prediction)
     import bid_engine
     if prediction is None:
         return []
@@ -1869,8 +1873,13 @@ def predict_final_for_bid(bid, history, policy=None):
     return prediction,final_recommendation_records(bid,prediction)
 
 
-def predict_final_batch(bids, history, policy=None):
+def predict_final_batch(bids, history, policy=None, strategy_mode=None):
     """Build one local engine per batch; malformed announcement dates stay blank."""
+    if strategy_mode is not None:
+        import bid_strategies
+        predictions=bid_strategies.recommend_bids(bids,history,policy,mode=strategy_mode)
+        return [{"prediction":p,"recommendations":bid_strategies.recommendation_records(b,p),
+                 "error":(p or {}).get("error","")} for b,p in zip(bids,predictions)]
     import bid_engine
     import bid_rules
     results=[{"prediction":None,"recommendations":[],"error":""} for _ in bids]
@@ -2192,13 +2201,16 @@ def make_strategy_summary_excel(results):
 # ════════════════════════════════════════════════════════════════
 st.markdown("""
 <div class="main-header">
-<h2>📊 투찰전략 분석 시스템 v2.15.10</h2>
+<h2>📊 투찰전략 분석 시스템 v2.15.11</h2>
 <p style="margin:0;opacity:0.8">입찰 참여조건에 따른 최대 3개 업체 추천 사정률·추천기준금액과 산정 근거</p>
 </div>""", unsafe_allow_html=True)
 
 with st.sidebar:
     st.header("⚙️ 시스템 설정")
     mode=st.radio("모드 선택",["📊 투찰전략 분석","🔧 배포자 관리"])
+    strategy_display=st.selectbox("전략 선택",list(bid_strategies.MODES))
+    strategy_mode=bid_strategies.MODES[strategy_display]
+    st.caption("관측 1위 기반 시험운영입니다. S1은 기존 계산 기준을 유지합니다.")
     st.divider()
     df_hist=load_history(); pattern_stats=load_pattern_stats()
     quality_info=load_history_quality(df_hist) if df_hist is not None else {}
@@ -2286,10 +2298,11 @@ else:
         no=n_o if 'n_o' in dir() else (df_c['발주기관'].nunique() if df_c is not None else 0)
         st.markdown(f"""
         <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:12px;font-size:0.9em">
-        <b>📌 분석 방법</b><br>
-        1️⃣ <b>업체 1:</b> 방향성 헷지 — 부호패턴 + 직전 2건 차이<br>
-        2️⃣ <b>업체 2:</b> 중심모델 — 백테스트 최적모델 + 최근90일 보수 오버레이<br>
-        3️⃣ <b>업체 3:</b> 라인 헷지 — 0.02 라인 + 직전 패턴 최다빈도<br><br>
+        <b>📌 적용 전략: {strategy_display}</b><br>
+        <b>자동 선택:</b> 전기공사 S4 · 건설사업관리 S3 · 기존사업 S3<br>
+        <b>근거:</b> 2026.09.27 연구의 분야별 관측 가격구간 통과율 1위<br>
+        <b>주의:</b> 실제 낙찰확률·미래 우위가 아닙니다. 기존사업의 통계적 우위는 미확정입니다.<br>
+        <b>소표본:</b> 동일범위 2년 → 최대4년 → S3 대체 → 참고 중심값 → 산정보류<br>
         <b>정렬:</b> 개찰일 → 공고번호 → 번호 안정 정렬(동일일 재현성 고정)<br>
         <b>참여:</b> 부산울산 지역제한 감리 1억원 이상 3개사·미만 2개사 · 경북·대구 지역제한 감리 1개사 · 한전 전국 감리 3개사 · 한전 VLF진단 1억원 이상 3개사·미만 2개사 · 기타진단 3개사 · 전기공사 1개사<br>
         <b>모델군:</b> 일반 건설사업관리·일반진단·설계·일반감리·한전감리·공동주택 및 주거시설 감리<br>
@@ -2304,7 +2317,7 @@ else:
 
     with st.spinner("파일 읽는 중..."):
         try:
-            raw_bytes = xls_file.read()
+            raw_bytes = xls_file.getvalue()
             # 낙찰이력 파일 오업로드 감지 (5MB 이상 + xlsx)
             if len(raw_bytes) > 3_000_000 and xls_file.name.lower().endswith(".xlsx"):
                 st.error(
@@ -2315,6 +2328,8 @@ else:
                 )
                 st.stop()
             bids = parse_xls(raw_bytes, xls_file.name)
+            original_bid_count=len(bids)
+            bids,revision_exclusions=bid_strategies.latest_notices(bids)
             if not bids:
                 st.error(
                     "입찰 건을 읽을 수 없습니다.\n\n"
@@ -2329,12 +2344,16 @@ else:
             )
             st.stop()
 
-    st.success(f"✅ {len(bids)}건 확인")
+    st.success(f"✅ 원본 {original_bid_count}행 · 구차수/중복 {len(revision_exclusions)}행 제외 · 최종 {len(bids)}건")
+    if revision_exclusions:
+        with st.expander("정정공고 제외내역"):
+            st.dataframe(pd.DataFrame(revision_exclusions),hide_index=True,use_container_width=True)
+    st.warning("관측 1위 기반 시험운영입니다. 추천기준금액은 최종 투찰금액이 아니며, 참가자격·A값·최저가격 조건은 공고 원문으로 확인하세요.")
     results=[]
     df_model=enrich_history(df_c) if df_c is not None else None
     with st.spinner(f"분석 중... ({len(bids)}건)"):
         try:
-            batch_predictions=predict_final_batch(bids,df_c)
+            batch_predictions=predict_final_batch(bids,df_c,strategy_mode=strategy_mode)
         except ValueError as exc:
             st.error(f"추천 계산을 진행할 수 없습니다: {exc}")
             st.stop()
@@ -2357,7 +2376,9 @@ else:
         is_scoped=bool(scope_info.get("applicable"))
         vals=[f"{r['rate']:+.4f}%" for r in recs]
         bases=[r["basis"] for r in recs]
-        notes=[]
+        prediction=row.get("prediction") or {}
+        notes=[f"전략: {prediction.get('selected_strategy','미확인')} / 상태: {prediction.get('status','미확인')}"]
+        notes.extend(prediction.get("fallback_notes",[]))
         if row.get("error"):
             notes.append(row["error"])
         if scope_info:
@@ -2477,16 +2498,20 @@ else:
 
     st.divider()
     st.subheader("💾 전략표 다운로드")
-    excel_buf=make_excel_simple(results,quality_info)
+    excel_buf=bid_strategies.add_review_sheets(make_excel_simple(results,quality_info),results,revision_exclusions)
     today_str=datetime.now().strftime("%Y%m%d")
     st.download_button("📥 업체 추천표 다운로드",
         data=excel_buf,
         file_name=f"투찰전략_{today_str}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",use_container_width=True)
-    summary_excel_buf=make_strategy_summary_excel(results)
+    summary_excel_buf=bid_strategies.add_review_sheets(make_strategy_summary_excel(results),results,revision_exclusions)
     st.download_button("📥 투찰전략 요약 다운로드",
         data=summary_excel_buf,
         file_name=f"투찰전략_요약_{today_str}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True)
+
+    st.download_button("📥 사전추천 계산기록 JSON 저장",
+        data=bid_strategies.snapshot(results,revision_exclusions),
+        file_name=f"투찰전략_계산기록_{today_str}.json",mime="application/json",use_container_width=True)

@@ -1,0 +1,107 @@
+name: Verify v2.15.11 strategies and revisions
+on:
+  push:
+    branches: [work/v2-15-11-strategy]
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: v2-15-11-verification
+  cancel-in-progress: true
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply reviewed app integration and safeguards
+        run: |
+          python .github/scripts/apply_v2_15_11.py
+          python .github/scripts/refine_v2_15_11.py
+      - name: Install existing runtime
+        run: python -m pip install -r requirements.txt
+      - name: Syntax and existing regression tests
+        run: |
+          python -m py_compile "입찰 앱.py" bid_engine.py bid_rules.py bid_legacy.py bid_strategies.py
+          PYTHONPATH=.:tests:analysis python -m unittest -v tests.test_bid_rules tests.test_bid_engine tests.test_backtest_v2_15_7 tests.test_app_v2_15_7 tests.test_app_v2_15_8 tests.test_app_v2_15_9 tests.test_app_v2_15_10 2>&1 | tee /tmp/existing-tests.log
+          test ${PIPESTATUS[0]} -eq 0
+      - name: New strategy, revision, real engine and AppTest verification
+        run: |
+          PYTHONPATH=.:tests:analysis python -m unittest -v tests.test_strategies_v2_15_11 2>&1 | tee /tmp/new-tests.log
+          test ${PIPESTATUS[0]} -eq 0
+          git diff --check
+      - name: Verify unchanged engines and no private data
+        run: |
+          git diff --exit-code abf72ef3ebba602271e5558973fb7395c88112ad -- bid_engine.py bid_rules.py bid_legacy.py model_policy.json requirements.txt
+          test -z "$(git status --porcelain data)"
+      - name: HTTP startup smoke
+        run: |
+          streamlit run "입찰 앱.py" --server.headless true --server.port 8501 >/tmp/streamlit.log 2>&1 &
+          APP_PID=$!
+          trap 'kill $APP_PID 2>/dev/null || true' EXIT
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8501/_stcore/health >/tmp/health.txt; then break; fi
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:8501/ >/tmp/home.html
+          grep -q 'Streamlit' /tmp/home.html
+      - name: Record tested scope
+        env:
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import os,re
+          old=Path('/tmp/existing-tests.log').read_text()
+          new=Path('/tmp/new-tests.log').read_text()
+          counts=[re.findall(r'Ran (\d+) tests? in',s)[-1] for s in (old,new)]
+          text=f'''# v2.15.11 구현·검증 기록
+
+          - 기준: v2.15.10 abf72ef3ebba602271e5558973fb7395c88112ad
+          - 실행: {os.environ['RUN_URL']}
+          - Python 문법검사: 통과
+          - 기존 핵심 회귀검사: {counts[0]}건 통과
+          - 신규 정정/전략/소표본/실제엔진/AppTest: {counts[1]}건 통과
+          - 소표본 기관 1~4건 절사평균 예외: 보완 및 회귀검사
+          - Streamlit AppTest: 최초화면 및 모의 입찰서류함 업로드 실행
+          - Streamlit HTTP 시작 및 health: 통과
+          - git diff --check: 통과
+          - 기존 engine/rules/legacy/policy/requirements: 원본 동일
+          - 원본 낙찰이력·회사 참여자료: 공개 업로드 없음
+
+          ## 검증의 한계
+          위 수치는 기능·회귀검사이며, 4년 원자료 직접실행 진단은 비공개 로컬 Work 자료로 별도 관리한다.
+          S3/S4 원전략 순위는 이전 2026-09-27 재현연구의 관측 결과다. 소표본 대체의 미래 성능은 미확정이다.
+          운영 로그인 후 화면·데이터 보존은 CI의 모의환경 검사와 다르며 별도 확인이 필요하다.
+          본 버전은 실제 낙찰확률 확정이 아닌 관측순위 기반 시험운영이다.
+          '''
+          Path('docs/change_requests/v2.15.11-implementation-verification.md').write_text(text,encoding='utf-8')
+          PY
+      - name: Commit verified integration to DEVELOPMENT branch only
+        run: |
+          git config user.name 'OpenAI Codex'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add "입찰 앱.py" bid_strategies.py README.md AGENTS.md tests docs/change_requests/v2.15.11-implementation-verification.md
+          if ! git diff --cached --quiet; then
+            git commit -m 'Verify v2.15.11 strategy integration and small-sample safeguards [skip ci]'
+            git push origin HEAD:work/v2-15-11-strategy
+          fi
+      - name: Package tested source only
+        if: always()
+        run: |
+          mkdir -p /tmp/verified-source
+          cp "입찰 앱.py" bid_engine.py bid_rules.py bid_legacy.py bid_strategies.py model_policy.json requirements.txt README.md AGENTS.md /tmp/verified-source/
+          cp -r tests /tmp/verified-source/
+          cp /tmp/*-tests.log /tmp/verified-source/ 2>/dev/null || true
+          find /tmp/verified-source -type d -name __pycache__ -prune -exec rm -rf {} +
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: v2.15.11-source-and-test-logs
+          path: /tmp/verified-source/
+          retention-days: 7
