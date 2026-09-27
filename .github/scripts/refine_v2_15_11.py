@@ -10,7 +10,8 @@ replace('    if not len(a):return None\n    lo,hi=np.quantile(a,[.1,.9]);trimmed
 '''    if not len(a):return None
     if len(a)<5:return float(np.mean(a))
     lo,hi=np.quantile(a,[.1,.9]);trimmed=a[(a>=lo)&(a<=hi)]''')
-replace('else "관측1위·시험" if selected in ("S3","S4") else "연구전략·시험"','else "연구전략·시험"')
+# Here the replacement is a substring of the old expression, so use exact old-match replacement.
+s=s.replace('else "관측1위·시험" if selected in ("S3","S4") else "연구전략·시험"','else "연구전략·시험"')
 replace('        if scope.get("scope_assumed"):meta["fallback_notes"].append',
 '''        if selected=="S1" and meta.get("selected_strategy")=="S1":
             meta["window_days"]="현행모형별 기존기간"
