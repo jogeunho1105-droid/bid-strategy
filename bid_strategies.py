@@ -101,6 +101,7 @@ def quantiles(family,issuer,date,count):
 def robust_center(records):
     a=np.asarray([float(r["value"]) for r in records])
     if not len(a):return None
+    if len(a)<5:return float(np.mean(a))
     lo,hi=np.quantile(a,[.1,.9]);trimmed=a[(a>=lo)&(a<=hi)]
     return float(.6*np.median(a)+.4*np.mean(trimmed))
 
@@ -176,7 +177,7 @@ def calculate_selected(family_all,issuer_all,date,count,selected,baseline):
     else:values=base
     if len(set(values))<count:notes.append("업체 간 동일 추천값 존재: 독립 분산효과로 해석하지 않음")
     meta["selected_strategy"]=used
-    meta["sample_status"]="대체·확인필요" if days!=730 or used!=selected else "관측1위·시험" if selected in ("S3","S4") else "연구전략·시험"
+    meta["sample_status"]="대체·확인필요" if days!=730 or used!=selected else "연구전략·시험"
     return [round(float(v),4) for v in values],meta
 
 
@@ -232,6 +233,10 @@ def recommend_bids(bids,history,policy=None,mode="auto"):
                 values,meta=calculate_selected(family,issuer,row["date"],scope["company_count"],"S3",[])
                 meta["fallback_notes"].insert(0,"S1 산출 불가 → 동일 범위 분포 대체")
         else:values,meta=calculate_selected(family,issuer,row["date"],scope["company_count"],selected,base_rates)
+        if selected=="S1" and meta.get("selected_strategy")=="S1":
+            meta["window_days"]="현행모형별 기존기간"
+        elif mode=="auto" and meta.get("selected_strategy")==selected and meta.get("window_days")==730 and meta.get("sample_status")=="연구전략·시험":
+            meta["sample_status"]="관측1위·시험"
         if scope.get("scope_assumed"):meta["fallback_notes"].append("입찰범위·참가회사 수에 기존 운영 가정 포함: 참가자격 별도 확인")
         if row["family"]=="kepco_supervision" and any("단가" in r["name"] for r in family):
             meta["fallback_notes"].append("학습범위에 단가감리 이력 포함: 기존 분류 정합성 검토 필요")
@@ -247,8 +252,10 @@ def recommendation_records(bid,prediction):
     selected=prediction.get("selected_strategy","S1");label=LABELS.get(selected,"소표본 참고값");rates=prediction["rates"]
     if len(rates)!=prediction["scope"]["company_count"] or any(not _finite(x) for x in rates):raise ValueError("추천 수·유한값 검사 실패")
     notes="; ".join(prediction.get("fallback_notes",[]))
+    window=prediction.get("window_days",730)
+    period=f"{window}일" if isinstance(window,int) else str(window)
     basis=(f"{label}; 동일모델군 {prediction.get('family_n',0)}건 / 동일기관 {prediction.get('issuer_n',0)}건; "
-           f"최근90일 n={prediction.get('recent90_n',0)}; 과거 {prediction.get('window_days',730)}일; "
+           f"최근90일 n={prediction.get('recent90_n',0)}; 기간 {period}; "
            f"{prediction.get('sample_status','확인필요')}; {notes}; 관측 통과율은 해당 공고의 낙찰확률 아님")
     return [dict(company=f"업체 {i+1}",rate=float(v),role=label,model=selected,model_label=f"{selected} {label}",basis_n=int(prediction.get("family_n",0)),basis=basis,strategy=selected,alternative=selected!="S1") for i,v in enumerate(rates)]
 

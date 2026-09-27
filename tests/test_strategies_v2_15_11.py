@@ -150,3 +150,23 @@ class AppIntegrationTests(unittest.TestCase):
 
 
 if __name__=="__main__":unittest.main()
+
+
+class SmallIssuerGuardTests(unittest.TestCase):
+    def test_robust_two_observations_is_finite(self):
+        self.assertAlmostEqual(strategy.robust_center([{"value":-.5},{"value":.7}]),.1)
+
+    def test_sparse_issuer_s2_parity_with_engine(self):
+        h=history();h.loc[:87,"발주기관"]="다른시청"
+        expected=engine.recommend_bid(bid(),h,{"rules":{}})
+        actual=strategy.recommend_bids([bid()],h,{"rules":{}},"S2")[0]
+        self.assertTrue(all(np.isfinite(x) for x in actual["rates"]))
+        self.assertEqual(actual["rates"],expected["recommendations"]["family_center"])
+
+    def test_manual_selection_does_not_claim_observed_first(self):
+        p=strategy.recommend_bids([bid()],history(),mode="S4")[0]
+        self.assertNotIn("관측1위",p["status"])
+
+    def test_s1_window_label_is_not_false_two_year_limit(self):
+        p=strategy.recommend_bids([bid()],history(),mode="S1")[0]
+        self.assertEqual(p["window_days"],"현행모형별 기존기간")
