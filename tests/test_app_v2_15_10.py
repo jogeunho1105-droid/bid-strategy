@@ -10,9 +10,9 @@ SUMMARY = APP.split("# ── 요약 테이블: 최종 추천값과 근거만 �
 
 class DefaultScreenLowerLimitV21510Tests(unittest.TestCase):
     def test_version_updated(self):
-        self.assertIn('MODEL_VERSION = "v2.15.10"', APP)
-        self.assertIn("투찰전략 분석 시스템 v2.15.10", APP)
-        self.assertTrue(README.startswith("# 투찰전략 분석 시스템 v2.15.10"))
+        self.assertIn('MODEL_VERSION = "v2.15.11"', APP)
+        self.assertIn("투찰전략 분석 시스템 v2.15.11", APP)
+        self.assertTrue(README.startswith("# 투찰전략 분석 시스템 v2.15.11"))
 
     def test_summary_includes_lower_limit_after_name(self):
         expected = ["중심모델군", "공고명", "낙찰하한율", "업체1추천", "업체2추천", "업체3추천", "비고"]
