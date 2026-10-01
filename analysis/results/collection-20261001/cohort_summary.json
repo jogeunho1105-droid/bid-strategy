@@ -1,0 +1,10 @@
+{
+  "old_valid_events": 46665,
+  "new_valid_events": 90831,
+  "matched_valid_events": 45874,
+  "old_only_valid_events": 791,
+  "new_only_valid_events": 44957,
+  "matched_outcome_changed": 115,
+  "confidence_interval": "paired dates block bootstrap 2000 draws seed2157; descriptive, no retuning",
+  "limitation": "Data coverage and outcome/source values changed. Differences are not proof of improved future performance or actual participation eligibility."
+}

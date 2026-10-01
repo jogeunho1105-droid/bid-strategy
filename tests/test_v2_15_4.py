@@ -188,7 +188,8 @@ class V2154Tests(unittest.TestCase):
         self.assertIn("데이터품질경고", headers)
         self.assertEqual(ws.cell(3, 11).value, 100_100_000)
         self.assertEqual(ws.cell(3, len(headers)).value, self.app["MODEL_VERSION"])
-        self.assertEqual(wb.sheetnames, ["업체별 추천", "사후낙찰검증", "검증기준"])
+        self.assertEqual(wb.sheetnames[:3], ["업체별 추천", "사후낙찰검증", "검증기준"])
+        self.assertTrue(set(wb.sheetnames[3:]).issubset({"데이터출처"}))
         audit_ws = wb["사후낙찰검증"]
         self.assertEqual(audit_ws.cell(3, 1).value, "N-1")
         self.assertEqual(audit_ws.cell(3, 6).value, 0.1)

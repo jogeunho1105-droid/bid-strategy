@@ -1,2 +1,8 @@
 __pycache__/
 *.py[cod]
+data/
+private-ledger/
+*.pkl
+*.xlsx
+*.xls
+.streamlit/secrets.toml

@@ -175,7 +175,8 @@ def get_three_pt(org, pred):
 @st.cache_data
 def load_history():
     if os.path.exists(HISTORY_FILE):
-        return prepare_history_frame(pd.read_pickle(HISTORY_FILE))
+        frame=pd.read_pickle(HISTORY_FILE)
+        return prepare_history_frame(frame)
     return None
 
 @st.cache_data
@@ -194,7 +195,11 @@ def prepare_history_frame(df):
     import bid_engine
     if df is None:
         return None
-    prepared=bid_engine.prepare_history(df)
+    import ledger_metadata
+    metadata=ledger_metadata.manifest(df)
+    prepared=bid_engine.prepare_history(df, metadata.get("as_of"))
+    if metadata:
+        prepared.attrs[ledger_metadata.ATTR]=metadata
     prepared["예가/기초(0%)"]=prepared["_value"]
     if "기초금액" in prepared:
         prepared["기초금액"]=prepared["_base"]
@@ -289,7 +294,31 @@ def history_period_text(quality):
 
 def save_history(df):
     os.makedirs(DATA_DIR, exist_ok=True)
+    import ledger_metadata
+    from pathlib import Path
+    import shutil
+    metadata=ledger_metadata.manifest(df,quality_path="__no_previous_metadata__")
+    if metadata:
+        frozen=Path(DATA_DIR)/"frozen_before_collection"
+        frozen.mkdir(exist_ok=True)
+        for old in (HISTORY_FILE,HISTORY_QUALITY_FILE):
+            if Path(old).exists() and not (frozen/Path(old).name).exists():
+                shutil.copy2(old,frozen/Path(old).name)
+        # Store all operational quality states separately from the filtered learning view.
+        source=Path(DATA_DIR)/(metadata['version']+".pkl")
+        if not source.exists():df.to_pickle(source)
+        lineage=Path(DATA_DIR)/(metadata['version']+"-lineage.csv.gz")
+        if df.attrs.get('collection_lineage_csv_gzip') and not lineage.exists():
+            lineage.write_bytes(df.attrs['collection_lineage_csv_gzip'])
+        review=Path(DATA_DIR)/(metadata['version']+"-classification.csv.gz")
+        if df.attrs.get('collection_classification_csv_gzip') and not review.exists():
+            review.write_bytes(df.attrs['collection_classification_csv_gzip'])
     quality=history_quality_summary(df)
+    if metadata:
+        quality[ledger_metadata.ATTR]=metadata
+        quality['valid_rows']=metadata['training_rows']
+        quality['data_start_date']=metadata['data_start_date']
+        quality['data_end_date']=metadata['data_end_date']
     prepare_history_frame(df).to_pickle(HISTORY_FILE)
     with open(HISTORY_QUALITY_FILE,"w",encoding="utf-8") as f:
         json.dump(quality,f,ensure_ascii=False,indent=2)
@@ -1810,7 +1839,9 @@ def make_excel(results):
         ws2.row_dimensions[r].height=36
     ws2.freeze_panes="A3"
 
-    buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+    buf=io.BytesIO(); wb.save(buf); buf.seek(0)
+    import ledger_metadata
+    return ledger_metadata.add_excel_metadata(buf,ledger_metadata.manifest())
 
 def recommendation_reference_amount(base_amount, rate):
     """낙찰하한율을 반영하지 않은 추천 사정률 기준 예정가격 성격의 금액."""
@@ -2125,7 +2156,9 @@ def make_excel_simple(results, quality=None):
     basis_ws.column_dimensions["A"].width=38
     basis_ws.column_dimensions["B"].width=92
     basis_ws.freeze_panes="A2"
-    buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+    buf=io.BytesIO(); wb.save(buf); buf.seek(0)
+    import ledger_metadata
+    return ledger_metadata.add_excel_metadata(buf,ledger_metadata.manifest())
 
 def format_lower_limit_rate(value):
     rate=parse_lower_limit_rate(value)
@@ -2193,7 +2226,9 @@ def make_strategy_summary_excel(results):
     last_row=max(2,len(results)+2)
     ws.auto_filter.ref=f"A2:E{last_row}"
     ws.freeze_panes="A3"
-    buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+    buf=io.BytesIO(); wb.save(buf); buf.seek(0)
+    import ledger_metadata
+    return ledger_metadata.add_excel_metadata(buf,ledger_metadata.manifest())
 
 
 # ════════════════════════════════════════════════════════════════
@@ -2211,9 +2246,18 @@ with st.sidebar:
     strategy_display=st.selectbox("전략 선택",list(bid_strategies.MODES))
     strategy_mode=bid_strategies.MODES[strategy_display]
     st.caption("관측 1위 기반 시험운영입니다. S1은 기존 계산 기준을 유지합니다.")
+    st.caption("원장 전환 지원: collection-20261001 · 추천모형 v2.15.11 유지")
     st.divider()
     df_hist=load_history(); pattern_stats=load_pattern_stats()
     quality_info=load_history_quality(df_hist) if df_hist is not None else {}
+    import ledger_metadata
+    active_manifest=ledger_metadata.manifest(df_hist)
+    if active_manifest:
+        st.caption(ledger_metadata.description(active_manifest))
+        st.warning(active_manifest['unresolved'])
+        st.caption(active_manifest['region_basis'])
+        if active_manifest.get('classification_review_events'):
+            st.warning(f"중복 출처의 업종 분류 확인대상 {active_manifest['classification_review_events']}키(학습 후보 {active_manifest['classification_review_learning_rows']}건): 용역 원문을 대표값으로 사용하며 실제 업종은 원문확인이 필요합니다.")
     if df_hist is not None:
         df_c_s=df_hist[df_hist["예가/기초(0%)"].notna()&(df_hist["예가/기초(0%)"].abs()<10)]
         n_c=len(df_c_s); n_o=df_c_s["발주기관"].nunique()
@@ -2221,6 +2265,10 @@ with st.sidebar:
         with st.expander("🔎 낙찰이력 데이터 품질"):
             st.caption(history_quality_warning(quality_info))
             st.caption(history_period_text(quality_info))
+            if active_manifest:
+                states=active_manifest['numeric_status'];warnings=active_manifest['warnings']
+                st.caption(f"원천행 품질: 예가·1순위 숫자 {states['both_numeric']:,}행 / 예가만 숫자 {states['target_only_numeric']:,}행 / 예가 숫자 없음 {states['target_not_numeric']:,}행")
+                st.caption(f"품질경고(중복 가능): 공고명 누락 {warnings['missing_name']} / 기관 누락 {warnings['missing_org']} / 개찰일 미확인 {warnings['missing_date']} / 미래 개찰 {warnings['future_opening']} / 비정상 예가 {warnings['abnormal_target']} / 비정상 1순위 {warnings['abnormal_winner']}")
             if int(quality_info.get("electric_region_missing_rows",0))>0:
                 st.warning(
                     "전기공사 지역 누락 행은 동일지역 요소를 제외하고 "
@@ -2231,6 +2279,8 @@ with st.sidebar:
     if pattern_stats:
         st.success(f"✅ 패턴통계 {len(pattern_stats)}개 발주처")
     with st.expander("📈 최근 엄격 백테스트 검증"):
+        if active_manifest:
+            st.caption("아래는 기존 원장·기존 기준일의 확정 검증기록입니다. 신규 원장 전후 회귀결과는 별도 전환 검증보고서를 확인하세요.")
         st.caption(
             f"{'이전 버전 검증 · ' if AUDIT_SUMMARY.get('previous_version') else ''}"
             f"{AUDIT_SUMMARY.get('version',MODEL_VERSION)} / 기준일 {AUDIT_SUMMARY.get('as_of','미확인')} · 같은 개찰일 결과를 학습에서 제외한 rolling 검증"
@@ -2263,7 +2313,7 @@ if mode=="🔧 배포자 관리":
         with st.spinner("처리 중..."):
             try:
                 content=uploaded.read()
-                df_new=pd.read_excel(io.BytesIO(content))
+                df_new=ledger_metadata.read_upload(content)
                 required=["개찰일","발주기관","공고명","기초금액","예가/기초(0%)"]
                 missing=[c for c in required if c not in df_new.columns]
                 if missing: st.error(f"필수 컬럼 없음: {missing}")

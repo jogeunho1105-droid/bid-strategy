@@ -1,0 +1,19 @@
+{
+  "source_rows": 112127,
+  "valid_history": 90831,
+  "as_of": "2026-10-01",
+  "source_sha256": "93634cb74ce95aa045234e79ef5c3410d82c11628c50d76e20107b695c062118",
+  "live_loop_sha256": "176c034f16c213b85ab8ac1302e0bfbe707819931e832a8958cf308f5cc57711",
+  "engine_sha256": "20869d602a52700bb38a19382f03cb204c4986bf28acb00260f7520f996d4c54",
+  "policy_sha256": "bc1b5f964c638413f177498d417018942872f97e6f0503023b4ffa9014ba56e5",
+  "runtime_seconds": 1721,
+  "same_day_training": false,
+  "burn_in": 150,
+  "strict_win": "actual < recommendation < winner; finite abs(winner)<10; missing winner excluded; nonpositive intervals remain losses per v2.15.7",
+  "strategy_refit": false,
+  "exclusions": {
+    "": 79252,
+    "other_kepco_local_branch": 11413,
+    "initial_history_under_150": 166
+  }
+}
