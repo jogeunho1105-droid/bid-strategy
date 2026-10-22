@@ -1,0 +1,2567 @@
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  투찰전략 분석 시스템 v2.15.11                                  ║
+# ║  개선: 6개 모델군 분리 + 전일 이력 공통 추천엔진 적용          ║
+# ║  - 완전 동일 중복 제거 및 데이터 품질 경고                     ║
+# ║  - 업체1·업체3은 헷지 포인트, 업체2는 중심모델로 명확화       ║
+# ║  - 전기공사 단일참여 1순위 추천모델 추가                       ║
+# ║  - 비한전/조달청: 3포인트 미적용, 단일전략 표시                 ║
+# ║  - ③트렌드 최소값 보정 (±0.02% 미만 시 보정)                  ║
+# ║  - ②유사표본 없을 때 진단/감리 분야 전체평균으로 대체           ║
+# ║  - 진단 분야 세분화 예측값 → ②유사표본에 통합                  ║
+# ║  - 용역성격별 최적모델로 추천 중심값 산정                       ║
+# ║  - 관련 이력 분위수 + 백테스트 중심값과 산정 근거 제공          ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import xlrd, io, os, json, re
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from datetime import datetime
+import bid_rules
+import bid_engine
+import bid_strategies
+
+plt.rcParams.update({"font.family": "DejaVu Sans", "axes.unicode_minus": False})
+
+st.set_page_config(page_title="투찰전략 분석 시스템", page_icon="📊", layout="wide")
+st.markdown("""
+<style>
+.main-header{background:linear-gradient(135deg,#1a2744,#243260);color:white;
+    padding:20px 30px;border-radius:10px;margin-bottom:20px}
+.val-box{border-radius:8px;padding:10px 15px;font-weight:bold;
+    font-size:1.1em;text-align:center;margin:4px 0}
+.val-pattern{background:#dbeafe;color:#1d4ed8}
+.val-similar{background:#dcfce7;color:#15803d}
+.val-trend{background:#fef9c3;color:#854d0e}
+.val-rec{background:#f3e8ff;color:#7c3aed}
+.val-a{background:#fee2e2;color:#991b1b;border-radius:8px;padding:10px 15px;
+    font-weight:bold;font-size:1.05em;text-align:center;margin:4px 0}
+.val-b{background:#dbeafe;color:#1d4ed8;border-radius:8px;padding:10px 15px;
+    font-weight:bold;font-size:1.05em;text-align:center;margin:4px 0}
+.val-c{background:#dcfce7;color:#15803d;border-radius:8px;padding:10px 15px;
+    font-weight:bold;font-size:1.05em;text-align:center;margin:4px 0}
+.grade-a{background:#dcfce7;color:#15803d;padding:2px 8px;border-radius:4px;font-weight:bold}
+.grade-b{background:#dbeafe;color:#1d4ed8;padding:2px 8px;border-radius:4px;font-weight:bold}
+.grade-c{background:#fef9c3;color:#854d0e;padding:2px 8px;border-radius:4px;font-weight:bold}
+.grade-d{background:#fee2e2;color:#991b1b;padding:2px 8px;border-radius:4px;font-weight:bold}
+.three-pt-box{background:#f8fafc;border:2px solid #1a2744;border-radius:10px;
+    padding:15px;margin:10px 0}
+</style>""", unsafe_allow_html=True)
+
+DATA_DIR     = "data"
+HISTORY_FILE = os.path.join(DATA_DIR, "history.pkl")
+HISTORY_QUALITY_FILE = os.path.join(DATA_DIR, "history_quality.json")
+PATTERN_FILE = os.path.join(DATA_DIR, "pattern_stats.json")
+BUNDLED_PATTERN_FILE = "pattern_stats.json"
+MODEL_VERSION = "v2.15.11"
+PREVIOUS_AUDIT_SUMMARY = {
+    "version": "v2.15.6",
+    "as_of": "2026-09-01",
+    "source_rows": 56_367,
+    "valid_rows": 46_319,
+    "backtest_rows": 46_167,
+    "recent_1y_total": 11_949,
+    "recent_1y_evaluable": 11_563,
+    "recent_1y_virtual_wins": 1_646,
+    "recent_1y_virtual_win_rate": 0.1423506011,
+    "recent_1y_center_or_single_rate": 0.0918446770,
+    "recent_1y_single_company_rate": 0.0789955532,
+    "recent_1y_three_company_rate": 0.1746467818,
+    "rule": "예가/기초(0%) < 추천사정율 < 1순위사정율(0%)",
+    "decision": "일괄 상향보정 후보는 보류검증 신뢰구간이 0을 포함하여 미반영",
+}
+
+
+def load_audit_summary():
+    """Display only a dated published audit; never infer a new success rate."""
+    import bid_engine
+    policy=bid_engine.load_policy()
+    summary=policy.get("summary") or {}
+    if not summary:
+        return dict(PREVIOUS_AUDIT_SUMMARY, previous_version=True)
+    recent=summary.get("recent1y",{})
+    return {
+        "version":policy.get("version",MODEL_VERSION),
+        "as_of":policy.get("as_of","기준일 미확인"),
+        "rule":"예가/기초(0%) < 추천사정율 < 1순위사정율(0%)",
+        "decision":f"보류검증을 통과한 {summary.get('accepted_route_count',0)}개 적용정책; {policy.get('effective_from','적용일 미정')}부터 반영",
+        "recent_1y_total":recent.get("공고수"),
+        "recent_1y_evaluable":recent.get("판정가능"),
+        "recent_1y_virtual_wins":recent.get("가상낙찰"),
+        "recent_1y_virtual_win_rate":recent.get("가상낙찰률"),
+        **summary,
+    }
+
+
+AUDIT_SUMMARY = load_audit_summary()
+os.makedirs(DATA_DIR, exist_ok=True)
+
+# ── 3포인트 전략 DB (분위수 기반, 30,614건 2026-05-13 업데이트) ─
+# A = 하위25% 분위수 / B = 예측중심(차트예측) / C = 상위75% 분위수
+# 실제 낙찰 분포는 ±1.5% 전 구간에 균등 분포 (복수예가 무작위 구조)
+# ①②③ 예측은 중앙경향성 / A·C는 실제 분포 커버 역할
+THREE_PT = {
+    "한국전력공사 경기본부":         {"bias":"음수↓","detail":"음60%/중13%/양27%","pt_a":-0.43,"pt_c":+0.27,"cover":67,"cover_r":73,"lo95":-1.01,"hi95":+0.96,"note":"분위수기반"},
+    "한국전력공사 부산울산본부":     {"bias":"음수↓","detail":"음55%/중23%/양23%","pt_a":-0.42,"pt_c":+0.29,"cover":71,"cover_r":87,"lo95":-1.07,"hi95":+0.91,"note":"최근커버 87%"},
+    "한국전력공사 대전세종충남본부": {"bias":"음수↓","detail":"음39%/중29%/양32%","pt_a":-0.45,"pt_c":+0.25,"cover":73,"cover_r":77,"lo95":-1.05,"hi95":+0.80,"note":"대형발주처"},
+    "한국전력공사 인천본부":         {"bias":"음수↓","detail":"음31%/중12%/양56%","pt_a":-0.40,"pt_c":+0.25,"cover":72,"cover_r":75,"lo95":-1.04,"hi95":+0.95,"note":"양수편향"},
+    "한국전력공사 서울본부":         {"bias":"양수↑","detail":"음20%/중20%/양60%","pt_a":-0.44,"pt_c":+0.20,"cover":60,"cover_r":70,"lo95":-1.07,"hi95":+0.83,"note":"양수편향 강함"},
+    "한국전력공사 경북본부":         {"bias":"균형", "detail":"음47%/중18%/양35%","pt_a":-0.38,"pt_c":+0.31,"cover":70,"cover_r":71,"lo95":-1.00,"hi95":+0.87,"note":"균형형"},
+    "한국전력공사 경남본부":         {"bias":"음수↓","detail":"음50%/중30%/양20%","pt_a":-0.44,"pt_c":+0.26,"cover":71,"cover_r":100,"lo95":-1.12,"hi95":+0.81,"note":"최근커버 100%!"},
+    "한국전력공사 광주전남본부":     {"bias":"음수↓","detail":"음52%/중10%/양38%","pt_a":-0.47,"pt_c":+0.24,"cover":68,"cover_r":67,"lo95":-1.08,"hi95":+0.86,"note":"음수편향"},
+    "한국전력공사 대구본부":         {"bias":"음수↓","detail":"음52%/중12%/양36%","pt_a":-0.43,"pt_c":+0.24,"cover":71,"cover_r":72,"lo95":-1.08,"hi95":+0.84,"note":"음수편향"},
+    "한국전력공사 강원본부":         {"bias":"음수↓","detail":"음53%/중13%/양33%","pt_a":-0.45,"pt_c":+0.24,"cover":65,"cover_r":93,"lo95":-1.05,"hi95":+0.83,"note":"최근커버 93%"},
+    "한국전력공사 전북본부":         {"bias":"음수↓","detail":"음56%/중11%/양33%","pt_a":-0.48,"pt_c":+0.24,"cover":73,"cover_r":0, "lo95":-1.08,"hi95":+0.81,"note":"음수편향"},
+    "한국전력공사 충북본부":         {"bias":"음수↓","detail":"음47%/중3%/양50%", "pt_a":-0.43,"pt_c":+0.28,"cover":72,"cover_r":0, "lo95":-1.01,"hi95":+0.88,"note":"균형형"},
+    "한국전력공사 경기북부본부":     {"bias":"균형", "detail":"음53%/중11%/양37%","pt_a":-0.46,"pt_c":+0.30,"cover":70,"cover_r":58,"lo95":-1.07,"hi95":+0.87,"note":"균형형"},
+    "한국전력공사 남서울본부":       {"bias":"균형", "detail":"음50%/중0%/양50%", "pt_a":-0.42,"pt_c":+0.29,"cover":72,"cover_r":0, "lo95":-1.03,"hi95":+0.92,"note":"균형형"},
+    "한국전력공사 제주본부":         {"bias":"음수↓","detail":"음50%/중15%/양35%","pt_a":-0.45,"pt_c":+0.18,"cover":69,"cover_r":0, "lo95":-1.13,"hi95":+0.73,"note":"제주"},
+}
+
+# 3포인트 적용 대상 여부 판단
+def is_three_pt_applicable(org, name):
+    """한전 발주처 + 복수예가 방식인 경우만 3포인트 적용"""
+    if not is_kepco(org):
+        return False
+    # 수의계약, 기초금액 매우 작은 건 제외
+    if any(kw in name for kw in ['수의','소액수의','전자견적']):
+        return False
+    return True
+
+# ── 기초금액 구간별 보정값 ─────────────────────────────────────
+AMT_BRACKETS = {
+    "~0.5억":  {"range":(0,   0.5),  "adj":+0.0013,"note":"소형"},
+    "0.5~1억": {"range":(0.5, 1.0),  "adj":+0.0045,"note":"소형"},
+    "1~2억":   {"range":(1.0, 2.0),  "adj":+0.0424,"note":"유리 ↑"},
+    "2~5억":   {"range":(2.0, 5.0),  "adj":-0.0295,"note":"보수적 ↓"},
+    "5~10억":  {"range":(5.0, 10.0), "adj":+0.0398,"note":"대형"},
+    "10억+":   {"range":(10.0,9999), "adj":+0.0373,"note":"대형"},
+}
+
+def get_amt_info(base_억):
+    for label, info in AMT_BRACKETS.items():
+        lo, hi = info["range"]
+        if lo <= base_억 < hi:
+            return label, info["adj"], info["note"]
+    return "미정", 0.0, ""
+
+def get_three_pt(org, pred):
+    """발주처별 3포인트 반환. 없으면 기본값"""
+    if org in THREE_PT:
+        d = THREE_PT[org]
+        return {
+            "pt_a": d["pt_a"],
+            "pt_b": round(pred, 4),   # 차트예측값
+            "pt_c": d["pt_c"],
+            "bias": d["bias"],
+            "detail": d["detail"],
+            "cover": d["cover"],
+            "cover_r": d["cover_r"],
+            "note": d["note"],
+            "found": True
+        }
+    return {
+        "pt_a": -0.40, "pt_b": round(pred, 4), "pt_c": +0.20,
+        "bias": "균형", "detail": "이력 부족",
+        "cover": 60, "cover_r": 0, "note": "기본값 적용",
+        "found": False
+    }
+
+# ── 낙찰이력 로드 ─────────────────────────────────────────────
+@st.cache_data
+def load_history():
+    if os.path.exists(HISTORY_FILE):
+        frame=pd.read_pickle(HISTORY_FILE)
+        return prepare_history_frame(frame)
+    return None
+
+@st.cache_data
+def load_pattern_stats():
+    source=next(
+        (path for path in (PATTERN_FILE,BUNDLED_PATTERN_FILE) if os.path.exists(path)),
+        None,
+    )
+    if source:
+        with open(source, encoding='utf-8') as f:
+            return json.load(f)
+    return {}
+
+def prepare_history_frame(df):
+    """학습과 화면이 동일한 유효 이력을 사용하도록 공통 정제를 적용한다."""
+    import bid_engine
+    if df is None:
+        return None
+    import ledger_metadata
+    metadata=ledger_metadata.manifest(df)
+    prepared=bid_engine.prepare_history(df, metadata.get("as_of"))
+    if metadata:
+        prepared.attrs[ledger_metadata.ATTR]=metadata
+    prepared["예가/기초(0%)"]=prepared["_value"]
+    if "기초금액" in prepared:
+        prepared["기초금액"]=prepared["_base"]
+    if "업체수" in prepared:
+        prepared["업체수"]=prepared["_companies"]
+    return prepared
+
+def history_quality_summary(df):
+    """업로드 원본을 기준으로 학습 제외·중복·지역 누락 현황을 계산한다."""
+    if df is None:
+        return {}
+    raw=df.copy()
+    row_count=int(len(raw))
+    exact_duplicates=int(raw.duplicated(keep="first").sum())
+    dedup=raw.drop_duplicates(keep="first").copy()
+    if "예가/기초(0%)" in dedup.columns:
+        target=pd.to_numeric(dedup["예가/기초(0%)"], errors="coerce")
+        valid_mask=target.notna() & (target.abs()<10)
+    else:
+        valid_mask=pd.Series(False,index=dedup.index)
+    valid=dedup[valid_mask].copy()
+    invalid_target=int(len(dedup)-len(valid))
+    if "지역" in valid.columns:
+        region_text=valid["지역"].fillna("").astype(str).str.strip()
+        region_missing=region_text.isin(["", "nan", "None", "NaT", "지역미상"])
+    else:
+        region_missing=pd.Series(True,index=valid.index)
+    if len(valid):
+        services=valid.apply(classify_service_row,axis=1)
+        electric_mask=services.eq("electric_construction")
+    else:
+        electric_mask=pd.Series(False,index=valid.index)
+    electric_count=int(electric_mask.sum())
+    electric_region_missing=int((electric_mask & region_missing).sum())
+    history_dates=pd.Series(dtype="datetime64[ns]")
+    for date_col in ("개찰일","입찰일","공고일","마감","투찰마감"):
+        if date_col in valid.columns:
+            parsed_dates=pd.to_datetime(valid[date_col],errors="coerce")
+            if parsed_dates.notna().any():
+                history_dates=parsed_dates.dropna()
+                break
+    return {
+        "source_rows":row_count,
+        "exact_duplicates":exact_duplicates,
+        "stored_rows":int(len(dedup)),
+        "valid_rows":int(len(valid)),
+        "invalid_target_rows":invalid_target,
+        "region_missing_rows":int(region_missing.sum()),
+        "region_missing_rate":float(region_missing.mean()) if len(valid) else 0.0,
+        "electric_rows":electric_count,
+        "electric_region_missing_rows":electric_region_missing,
+        "electric_region_missing_rate":(
+            float(electric_region_missing/electric_count) if electric_count else 0.0
+        ),
+        "data_start_date":history_dates.min().strftime("%Y-%m-%d") if len(history_dates) else None,
+        "data_end_date":history_dates.max().strftime("%Y-%m-%d") if len(history_dates) else None,
+        "model_version":MODEL_VERSION,
+    }
+
+@st.cache_data
+def load_history_quality(df=None):
+    if os.path.exists(HISTORY_QUALITY_FILE):
+        try:
+            with open(HISTORY_QUALITY_FILE,encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return history_quality_summary(df) if df is not None else {}
+
+def history_quality_warning(quality):
+    if not quality:
+        return "데이터 품질 정보 없음"
+    return (
+        f"완전 동일 중복 {int(quality.get('exact_duplicates',0)):,}행 제거; "
+        f"목표값 누락·비정상 {int(quality.get('invalid_target_rows',0)):,}행 제외; "
+        f"지역 누락 {int(quality.get('region_missing_rows',0)):,}행"
+        f"({float(quality.get('region_missing_rate',0)):.1%}); "
+        f"전기공사 지역 누락 {int(quality.get('electric_region_missing_rows',0)):,}/"
+        f"{int(quality.get('electric_rows',0)):,}행"
+        f"({float(quality.get('electric_region_missing_rate',0)):.1%})"
+    )
+
+def history_period_text(quality):
+    """업로드 이력에서 확인된 최초·최종 개찰일을 짧게 표시한다."""
+    if not quality:
+        return "이력 기간 확인 불가"
+    start=quality.get("data_start_date")
+    end=quality.get("data_end_date")
+    if start and end:
+        return f"이력 기간 {start} ~ {end}"
+    return "이력 기간 확인 불가"
+
+def save_history(df):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    import ledger_metadata
+    from pathlib import Path
+    import shutil
+    metadata=ledger_metadata.manifest(df,quality_path="__no_previous_metadata__")
+    if metadata:
+        frozen=Path(DATA_DIR)/"frozen_before_collection"
+        frozen.mkdir(exist_ok=True)
+        for old in (HISTORY_FILE,HISTORY_QUALITY_FILE):
+            if Path(old).exists() and not (frozen/Path(old).name).exists():
+                shutil.copy2(old,frozen/Path(old).name)
+        # Store all operational quality states separately from the filtered learning view.
+        source=Path(DATA_DIR)/(metadata['version']+".pkl")
+        if not source.exists():df.to_pickle(source)
+        lineage=Path(DATA_DIR)/(metadata['version']+"-lineage.csv.gz")
+        if df.attrs.get('collection_lineage_csv_gzip') and not lineage.exists():
+            lineage.write_bytes(df.attrs['collection_lineage_csv_gzip'])
+        review=Path(DATA_DIR)/(metadata['version']+"-classification.csv.gz")
+        if df.attrs.get('collection_classification_csv_gzip') and not review.exists():
+            review.write_bytes(df.attrs['collection_classification_csv_gzip'])
+    quality=history_quality_summary(df)
+    if metadata:
+        quality[ledger_metadata.ATTR]=metadata
+        quality['valid_rows']=metadata['training_rows']
+        quality['data_start_date']=metadata['data_start_date']
+        quality['data_end_date']=metadata['data_end_date']
+    prepare_history_frame(df).to_pickle(HISTORY_FILE)
+    with open(HISTORY_QUALITY_FILE,"w",encoding="utf-8") as f:
+        json.dump(quality,f,ensure_ascii=False,indent=2)
+    st.cache_data.clear()
+    return quality
+
+def save_pattern_stats(stats):
+    with open(PATTERN_FILE, "w", encoding="utf-8") as f:
+        json.dump(stats, f, ensure_ascii=False, indent=2)
+    st.cache_data.clear()
+
+# ── 분석 함수 ─────────────────────────────────────────────────
+def analyze_pattern(org, df_c, pattern_stats):
+    if org in pattern_stats:
+        st_d = pattern_stats[org]
+        return {
+            "pred":         st_d.get("pred", 0),
+            "conservative": st_d.get("conservative", 0),
+            "aggressive":   st_d.get("aggressive", 0),
+            "trend":        st_d.get("trend", "→횡보"),
+            "pattern":      st_d.get("pattern", "무작위패턴").replace("패턴",""),
+            "autocorr":     st_d.get("autocorr", 0),
+            "last_val":     st_d.get("last_val", 0),
+            "r5":           st_d.get("r5", 0),
+            "r10":          st_d.get("r10", 0),
+            "mean":         st_d.get("mean", 0),
+            "std":          st_d.get("std", 0.5),
+            "n":            st_d.get("n", 0),
+            "w5":           st_d.get("w5", 0.25),
+            "w10":          st_d.get("w10", 0.20),
+            "wm":           st_d.get("wm", 0.55),
+            "grade":        st_d.get("grade", "C"),
+            "mae":          st_d.get("mae", 0.5),
+            "drift6m":      st_d.get("drift6m", 0),
+            "trend_boost":  st_d.get("trend_boost", 0),
+            "drift_note":   st_d.get("drift_note", ""),
+            "recent10":     st_d.get("recent10", []),
+            "all_vals":     None,
+            "source":       "패턴통계DB"
+        }
+    if df_c is None: return None
+    sub = df_c[df_c["발주기관"]==org]["예가/기초(0%)"].values
+    if len(sub) < 5: return None
+    n=len(sub); mean=np.mean(sub); std=np.std(sub)
+    r5=np.mean(sub[-5:]); r10=np.mean(sub[-10:]) if n>=10 else mean
+    ac=float(np.corrcoef(sub[:-1],sub[1:])[0,1]) if n>=3 else 0
+    coef=float(np.polyfit(np.arange(min(20,n)),sub[-min(20,n):],1)[0])
+    trend   = "↑상승" if coef>0.02 else "↓하락" if coef<-0.02 else "→횡보"
+    pattern = "연속성" if ac>0.2 else "반전" if ac<-0.2 else "무작위"
+    w5,w10,wm = 0.25,0.20,0.55
+    pred = w5*r5 + w10*r10 + wm*mean
+    lv = float(sub[-1])
+    adj = (lv*abs(ac)*0.2 if pattern=="연속성" else
+           -lv*abs(ac)*0.3 if pattern=="반전" else 0.0)
+    pred_final = round(pred+adj, 4)
+    errs=[abs((0.25*np.mean(sub[:i][-5:])+0.20*(np.mean(sub[:i][-10:]) if i>=10 else np.mean(sub[:i]))+0.55*np.mean(sub[:i]))-sub[i])
+          for i in range(min(10,n//2),n)]
+    mae=np.mean(errs) if errs else 0.5
+    grade="A" if mae<0.35 else "B" if mae<0.45 else "C" if mae<0.55 else "D"
+    return {
+        "pred":pred_final,"conservative":round(pred_final-std*0.4,4),
+        "aggressive":round(pred_final+std*0.4,4),
+        "trend":trend,"pattern":pattern,"autocorr":round(ac,4),
+        "last_val":round(lv,4),"r5":round(r5,4),"r10":round(r10,4),
+        "mean":round(mean,4),"std":round(std,4),"n":n,
+        "w5":w5,"w10":w10,"wm":wm,"grade":grade,"mae":round(mae,4),
+        "drift6m":0.0,"trend_boost":0.0,"drift_note":"",
+        "recent10":[round(float(v),4) for v in sub[-10:]],
+        "all_vals":sub.tolist(),"source":"직접계산"
+    }
+
+def analyze_similar(name, base_원, df_c):
+    """② 유사표본 분석 — 이력 없으면 진단/감리 분야 전체평균으로 대체"""
+    if df_c is None or base_원<=0: return None
+    kws=[kw for kw in ["PD","VLF","감리","진단","설계","측정","광학","초음파","콘크리트"] if kw in name]
+    if not kws: kws=["감리"]
+    mask=pd.Series([False]*len(df_c),index=df_c.index)
+    for kw in kws: mask=mask|df_c["공고명"].str.contains(kw,na=False)
+    # ① 기초금액 ±50% 범위
+    sim=df_c[mask&(df_c["기초금액"]>=base_원*0.5)&(df_c["기초금액"]<=base_원*1.5)]
+    # ② ±100% 범위로 확대
+    if len(sim)<3:
+        sim=df_c[mask&(df_c["기초금액"]>=base_원*0.3)&(df_c["기초금액"]<=base_원*2.0)]
+    # ③ 이력 부족 → 한전 포함 진단/감리 전체 평균으로 대체
+    if len(sim)<3:
+        if df_c is not None:
+            # 진단 분야 → 한전 진단 전체평균
+            if is_diag(name):
+                kepco_mask = df_c['발주기관'].str.contains('한국전력공사',na=False)
+                diag_mask  = df_c['공고명'].str.contains('|'.join(DIAG_KWS),na=False)
+                sim = df_c[kepco_mask & diag_mask]
+            # 감리 분야 → 한전 감리 전체평균
+            elif is_supervision(name):
+                kepco_mask = df_c['발주기관'].str.contains('한국전력공사',na=False)
+                sup_mask   = df_c['공고명'].str.contains('감리',na=False)
+                sim = df_c[kepco_mask & sup_mask]
+        if len(sim)<3: return None
+        # 대체 평균임을 표시
+        vals=sim["예가/기초(0%)"].values; n=len(vals)
+        weights=np.linspace(0.5,1.5,n)
+        co=sim["업체수"].mean() if "업체수" in sim.columns else None
+        return {
+            "pred":round(float(np.average(vals,weights=weights)),4),
+            "n":n,"mean":round(float(np.mean(vals)),4),
+            "std":round(float(np.std(vals)),4),
+            "avg_companies":round(float(co),1) if co and not np.isnan(float(co)) else None,
+            "keywords":kws,"fallback":True,"fallback_note":"분야 전체평균 대체"
+        }
+    vals=sim["예가/기초(0%)"].values; n=len(vals)
+    weights=np.linspace(0.5,1.5,n)
+    co=sim["업체수"].mean() if "업체수" in sim.columns else None
+    return {
+        "pred":round(float(np.average(vals,weights=weights)),4),
+        "n":n,"mean":round(float(np.mean(vals)),4),
+        "std":round(float(np.std(vals)),4),
+        "avg_companies":round(float(co),1) if co and not np.isnan(float(co)) else None,
+        "keywords":kws,"fallback":False
+    }
+
+def analyze_trend(org, df_c):
+    """③ 트렌드 분석 — 최소값 보정 (±0.02% 미만 시 평균으로 보정)"""
+    if df_c is None: return None
+    sub=df_c[df_c["발주기관"]==org]
+    vals=sub["예가/기초(0%)"].values
+    if len(vals)<5: return None
+    rn=max(5,len(vals)//4); recent=vals[-rn:]; older=vals[:-rn]
+    rm=float(np.mean(recent)); om=float(np.mean(older)) if len(older)>0 else rm
+    drift=rm-om; r3=vals[-3:] if len(vals)>=3 else vals
+    co=sub["업체수"].tail(rn).mean() if "업체수" in sub.columns else None
+    raw_pred = rm+drift*0.3
+    # ── 최소값 보정: 예측값이 ±0.02% 미만으로 0에 수렴하면 전체평균으로 대체
+    if abs(raw_pred) < 0.02:
+        raw_pred = float(np.mean(vals))
+    return {
+        "pred":round(raw_pred,4),"recent_mean":round(rm,4),
+        "drift":round(drift,4),"recent_n":rn,
+        "recent3_mean":round(float(np.mean(r3)),4),
+        "avg_companies":round(float(co),1) if co and not np.isnan(float(co)) else None
+    }
+
+def recommend_range(a1,a2,a3):
+    vals=[v["pred"] for v in [a1,a2,a3] if v]
+    if not vals: return None,None
+    mv=np.mean(vals); sv=np.std(vals) if len(vals)>1 else 0.1
+    return round(mv-sv*0.5,4),round(mv+sv*0.5,4)
+
+def convergence_score(a1,a2,a3):
+    vals=[v["pred"] for v in [a1,a2,a3] if v]
+    if len(vals)<2: return None,"데이터부족"
+    sv=np.std(vals)
+    if sv<0.05:   return sv,"★★★ 높음"
+    elif sv<0.10: return sv,"★★☆ 보통"
+    elif sv<0.20: return sv,"★☆☆ 낮음"
+    else:         return sv,"⚠️ 분산큼"
+
+# ── 개선 추천모델: 31,586건 이력 백테스트 기반 ─────────────────
+SERVICE_LABELS = {
+    "PD":"PD", "VLF":"VLF", "optical":"광학", "concrete":"콘크리트",
+    "ultrasound":"초음파", "supervision":"감리", "design":"설계",
+    "construction_management":"건설사업관리", "diagnosis_other":"진단기타",
+    "other":"기타",
+    "electric_construction":"전기공사"
+}
+
+SERVICE_CHART_LABELS = {
+    "PD":"PD", "VLF":"VLF", "optical":"Optical", "concrete":"Concrete",
+    "ultrasound":"Ultrasound", "supervision":"Supervision", "design":"Design",
+    "construction_management":"Construction Management",
+    "diagnosis_other":"Diagnosis", "other":"Other",
+    "electric_construction":"Electrical Construction"
+}
+
+MODEL_LABELS = {
+    "all_recent20":"전체 최근20건",
+    "service_recent20":"용역성격 최근20건",
+    "svc_amount_recent20":"용역성격+금액구간 최근20건",
+    "blend_weighted":"가중혼합",
+    "service_nearest10_limited":"용역성격 유사패턴 최근10건",
+    "org_service_recent20":"발주처+용역성격 최근20건",
+    "blend_mean":"평균혼합",
+    "org_service_nearest5_limited":"발주처+용역성격 유사패턴 최근5건",
+    "org_recent20":"발주처 최근20건",
+    "bayes_shrink":"베이지안 축소평균",
+    "ar1_shrink":"축소 AR(1)",
+}
+
+MODEL_RULES = {
+    "PD": {"model":"all_recent20", "mae":0.4414, "p70":0.5960},
+    "VLF": {"model":"blend_weighted", "mae":0.4038, "p70":0.5447},
+    "concrete": {"model":"blend_mean", "mae":0.3881, "p70":0.4848},
+    "construction_management": {"model":"blend_mean", "mae":0.5586, "p70":0.7028},
+    "design": {"model":"blend_mean", "mae":0.5152, "p70":0.6654},
+    "diagnosis_other": {"model":"org_service_nearest5_limited", "mae":0.4845, "p70":0.6992},
+    "optical": {"model":"blend_weighted", "mae":0.4368, "p70":0.5555},
+    "other": {"model":"blend_mean", "mae":0.4803, "p70":0.5000},
+    "supervision": {"model":"blend_mean", "mae":0.4697, "p70":0.5842},
+    "ultrasound": {"model":"org_recent20", "mae":0.5391, "p70":0.7099},
+    "electric_construction": {"model":"blend_weighted", "mae":0.4754, "p70":0.7603},
+    "_default": {"model":"org_service_recent20", "mae":0.4787, "p70":0.6198},
+}
+
+INTERNAL_ROUTER_RULES = {
+    ("기타", "diagnosis_other"): "bayes_shrink",
+    ("기타", "other"): "bayes_shrink",
+    ("기타", "design"): "bayes_shrink",
+    ("조달청", "supervision"): "bayes_shrink",
+    ("조달청", "construction_management"): "ar1_shrink",
+}
+
+TARGET_SCALE = {60:0.82, 70:1.00, 80:1.26}
+
+KEPCO_LOCAL_ORGS = {
+    "한국전력공사 부산울산본부": 2,
+    "한국전력공사 경북본부": 1,
+    "한국전력공사 대구본부": 1,
+}
+KEPCO_NATIONAL_COMPANY_COUNT = 3
+KEPCO_BUSAN_ULSAN_ORG = "한국전력공사 부산울산본부"
+KEPCO_BUSAN_THREE_COMPANY_BASE_THRESHOLD = 100_000_000
+
+def kepco_local_company_count(org, base):
+    """한전 지역제한 감리의 실제 참여 가능 업체 수를 반환한다."""
+    import bid_rules
+    return bid_rules.kepco_local_company_count(org,base)
+
+def notice_amount_for_year(year):
+    """물품·용역 고시금액. 2021~2026 운영 기준을 2년 단위로 적용한다."""
+    import bid_rules
+    return bid_rules.notice_amount_for_year(year)
+
+def parse_date_series(series):
+    """낙찰이력의 YY.MM.DD와 일반 날짜 형식을 함께 처리한다."""
+    import bid_rules
+    return bid_rules.parse_date_series(series)
+
+def year_from_value(value):
+    import bid_rules
+    return bid_rules.year_from_value(value)
+
+def classify_kepco_scope(bid):
+    """현재 입찰의 한전 감리 지역·전국 구분과 참여업체 수를 반환한다."""
+    import bid_rules
+    info=bid_rules.classify_kepco_scope(bid)
+    if info.get("scope")=="지역제한" and bid_rules.kepco_branch(bid.get("org"))=="부산울산":
+        info["basis"]+=("; 기초금액 1억원 미만으로 2개사 참여" if info["company_count"]==2 else "; 기초금액 1억원 이상으로 3개사 참여")
+    return info
+
+def classify_service(name, industry=None):
+    import bid_rules
+    return bid_rules.classify_service(name,industry)
+
+def classify_service_row(row):
+    return classify_service(row.get("공고명",""), row.get("업종",""))
+
+def is_electric_construction_bid(bid):
+    return classify_service(bid.get("name",""), bid.get("industry",""))=="electric_construction"
+
+def amount_bucket(base_원):
+    try:
+        eok=float(base_원 or 0)/1e8
+    except Exception:
+        eok=0
+    if eok<=0: return "금액미상"
+    if eok<0.3: return "0.3억미만"
+    if eok<0.5: return "0.3~0.5억"
+    if eok<1.0: return "0.5~1억"
+    if eok<2.0: return "1~2억"
+    if eok<5.0: return "2~5억"
+    return "5억이상"
+
+def company_bucket(v):
+    try:
+        x=float(v)
+        if np.isnan(x): return None
+        return int(x//10*10)
+    except Exception:
+        return None
+
+def history_sorted(df):
+    if df is None or len(df)==0: return pd.DataFrame()
+    # 완전 동일 중복만 제거한다. 공고번호가 같더라도 재공고·재개찰 행은 유지한다.
+    d=df.drop_duplicates(keep="first").copy()
+    for col in ["개찰일", "입찰일", "공고일", "마감", "투찰마감"]:
+        if col in d.columns:
+            dt=parse_date_series(d[col])
+            if dt.notna().sum()>0:
+                d=d.assign(_dt=dt)
+                sort_cols=["_dt"]
+                if "공고번호" in d.columns:
+                    d["_sort_notice"]=d["공고번호"].fillna("").astype(str)
+                    sort_cols.append("_sort_notice")
+                if "번호" in d.columns:
+                    d["_sort_no"]=pd.to_numeric(d["번호"],errors="coerce")
+                    sort_cols.append("_sort_no")
+                # mergesort는 동일 키의 기존 순서를 보존해 같은 파일의 반복 실행값을 고정한다.
+                d=d.sort_values(sort_cols,kind="mergesort",na_position="last")
+                return d.drop(columns=["_dt","_sort_notice","_sort_no"],errors="ignore")
+    return d.reset_index(drop=True)
+
+def enrich_history(df):
+    import bid_rules
+    d=history_sorted(df)
+    if len(d)==0: return d
+    d=d.copy()
+    d["_service"]=d.apply(classify_service_row, axis=1) if "공고명" in d.columns else "other"
+    d["_family"]=[bid_rules.classify_model_family(n,i,o) for n,i,o in zip(
+        d.get("공고명",pd.Series("",index=d.index)),
+        d.get("업종",pd.Series("",index=d.index)),
+        d.get("발주기관",pd.Series("",index=d.index)),
+    )]
+    d["_amount_bucket"]=d["기초금액"].apply(amount_bucket) if "기초금액" in d.columns else "금액미상"
+    d["_company_bucket"]=d["업체수"].apply(company_bucket) if "업체수" in d.columns else None
+    date_col=next((c for c in ["개찰일","입찰일","공고일"] if c in d.columns),None)
+    if date_col:
+        dates=parse_date_series(d[date_col])
+        years=dates.dt.year.fillna(datetime.now().year).astype(int)
+    else:
+        dates=pd.Series(pd.NaT,index=d.index,dtype="datetime64[ns]")
+        years=pd.Series(datetime.now().year,index=d.index,dtype=int)
+    d["_date"]=dates.dt.normalize()
+    d["_bid_year"]=years
+    d["_notice_amount"]=years.apply(notice_amount_for_year)
+    bases=pd.to_numeric(d["기초금액"],errors="coerce") if "기초금액" in d.columns else pd.Series(np.nan,index=d.index)
+    d["_estimated_price"]=bases/1.1
+    d["_kepco_scope"]=[bid_rules.historical_scope(n,i,o,b,dt) for n,i,o,b,dt in zip(
+        d.get("공고명",pd.Series("",index=d.index)),
+        d.get("업종",pd.Series("",index=d.index)),
+        d.get("발주기관",pd.Series("",index=d.index)),bases,dates,
+    )]
+    return d
+
+def classify_bid_scope(bid):
+    """한전 감리 입찰범위와 전기공사 단일참여 조건을 통합 분류한다."""
+    import bid_rules
+    if classify_service(bid.get("name",""),bid.get("industry",""))=="supervision":
+        return classify_kepco_scope(bid)
+    return bid_rules.classify_bid_scope(bid)
+
+def history_for_bid(bid, df_c, scope_info=None):
+    """차트·보조분석에도 현재 공고일 이전의 유효 이력만 허용한다."""
+    import bid_rules
+    if df_c is None or len(df_c)==0:
+        return df_c
+    info=scope_info or classify_bid_scope(bid)
+    d=df_c if "_kepco_scope" in df_c.columns and "_date" in df_c.columns else enrich_history(df_c)
+    bid_date=bid_rules.parse_date_value(bid.get("deadline"))
+    if bid_date is None:
+        return d.iloc[0:0].copy()
+    dates=pd.to_datetime(d["_date"],errors="coerce").dt.normalize()
+    target=pd.to_numeric(d["예가/기초(0%)"],errors="coerce")
+    d=d.loc[dates.notna() & dates.lt(pd.Timestamp(bid_date).normalize()) & target.notna() & target.abs().lt(10)].copy()
+    if not info["applicable"]:
+        return d
+    if info.get("scope")=="전기공사 단일참여":
+        return d[d["_service"]=="electric_construction"].copy()
+    mask=(
+        d["발주기관"].astype(str).str.contains("한국전력공사",na=False)
+        & (d["_service"]=="supervision")
+        & (d["_kepco_scope"]==info["scope"])
+    )
+    return d[mask].copy()
+
+def val_mean(df, n=None):
+    if df is None or len(df)==0 or "예가/기초(0%)" not in df.columns: return None
+    vals=df["예가/기초(0%)"].dropna().astype(float)
+    if len(vals)==0: return None
+    if n: vals=vals.tail(n)
+    return float(vals.mean()) if len(vals)>0 else None
+
+def nearest_mean(df, current_hint, n=10, limit=180):
+    if df is None or len(df)<3 or "예가/기초(0%)" not in df.columns: return None
+    vals=df["예가/기초(0%)"].dropna().astype(float).tail(limit).to_numpy()
+    if len(vals)<3: return None
+    hint=float(current_hint if current_hint is not None else np.mean(vals[-min(10,len(vals)):]))
+    idx=np.argsort(np.abs(vals-hint))[:min(n,len(vals))]
+    return float(np.mean(vals[idx]))
+
+def weighted_mean(items):
+    ok=[(v,w) for v,w in items if v is not None]
+    if not ok: return None
+    sw=sum(w for _,w in ok)
+    return float(sum(v*w for v,w in ok)/sw) if sw else None
+
+def classify_org_group(org):
+    s=str(org or "")
+    if "한국전력" in s or "한전" in s:
+        return "한국전력공사"
+    if "조달청" in s:
+        return "조달청"
+    return "기타"
+
+def quantile_clip_value(value, values):
+    clean=[float(v) for v in values if v is not None and np.isfinite(float(v))]
+    if len(clean)<10:
+        return float(value)
+    lower=float(np.quantile(clean,.05))
+    upper=float(np.quantile(clean,.95))
+    return float(np.clip(value,lower,upper))
+
+def bayesian_shrinkage(local_values, prior_values, global_values, k=10):
+    prior_source=prior_values[-100:] if prior_values else global_values[-100:]
+    prior=float(np.mean(prior_source)) if prior_source else 0.0
+    local=np.asarray(local_values[-50:], dtype=float)
+    if len(local)==0:
+        return prior
+    return float((len(local)*np.mean(local)+k*prior)/(len(local)+k))
+
+def ar1_shrink_prediction(values, center, ridge=10.0):
+    arr=np.asarray(values[-30:], dtype=float)
+    if len(arr)<8:
+        return float(center)
+    x=arr[:-1]
+    y=arr[1:]
+    x_centered=x-np.mean(x)
+    y_centered=y-np.mean(y)
+    beta=float(np.sum(x_centered*y_centered)/(np.sum(x_centered**2)+ridge))
+    beta=float(np.clip(beta,-0.5,0.5))
+    intercept=float(np.mean(y)-beta*np.mean(x))
+    raw=intercept+beta*arr[-1]
+    return quantile_clip_value(0.5*raw+0.5*center, values)
+
+def build_model_candidates(bid, df_e):
+    if df_e is None or len(df_e)==0: return {}, {}
+    org=bid.get("org","")
+    svc=classify_service(bid.get("name",""), bid.get("industry",""))
+    amt=amount_bucket(bid.get("base",0))
+    base=df_e
+    pools={
+        "전체":base,
+        "발주처":base[base["발주기관"].astype(str)==str(org)] if "발주기관" in base.columns else base.iloc[0:0],
+        "용역성격":base[base["_service"]==svc] if "_service" in base.columns else base.iloc[0:0],
+        "용역성격+금액":base[(base["_service"]==svc)&(base["_amount_bucket"]==amt)] if "_service" in base.columns else base.iloc[0:0],
+        "발주처+용역성격":base[(base["발주기관"].astype(str)==str(org))&(base["_service"]==svc)] if "발주기관" in base.columns and "_service" in base.columns else base.iloc[0:0],
+    }
+    hint=val_mean(pools["발주처"], 10) or val_mean(pools["용역성격"], 10) or val_mean(base, 20)
+    candidates={
+        "all_recent20":val_mean(pools["전체"],20),
+        "org_recent20":val_mean(pools["발주처"],20),
+        "service_recent20":val_mean(pools["용역성격"],20),
+        "svc_amount_recent20":val_mean(pools["용역성격+금액"],20),
+        "org_service_recent20":val_mean(pools["발주처+용역성격"],20),
+        "service_nearest10_limited":nearest_mean(pools["용역성격"], hint, n=10),
+        "org_service_nearest5_limited":nearest_mean(pools["발주처+용역성격"], hint, n=5),
+    }
+    blend_base=[
+        (candidates["org_recent20"],0.35),
+        (candidates["org_service_recent20"],0.25),
+        (candidates["svc_amount_recent20"] or candidates["service_recent20"],0.20),
+        (candidates["service_recent20"],0.10),
+        (candidates["all_recent20"],0.10),
+    ]
+    candidates["blend_weighted"]=weighted_mean(blend_base)
+    mean_vals=[
+        (candidates["org_recent20"],1),
+        (candidates["org_service_recent20"],1),
+        (candidates["svc_amount_recent20"] or candidates["service_recent20"],1),
+        (candidates["all_recent20"],1),
+    ]
+    candidates["blend_mean"]=weighted_mean(mean_vals)
+    return candidates, pools
+
+def pick_candidate(model, candidates):
+    fallback_order=[model, "org_service_recent20", "org_recent20", "svc_amount_recent20",
+                    "service_recent20", "blend_weighted", "blend_mean", "all_recent20"]
+    for key in fallback_order:
+        val=candidates.get(key)
+        if val is not None:
+            return key, val
+    return None, None
+
+def choose_routed_company2(org, svc, current_model, current_pred, candidates, pools, df_e, rate):
+    """백테스트에서 개선 효과가 확인된 기관·분야 조합만 내부 개선모델을 적용한다."""
+    org_group=classify_org_group(org)
+    method=INTERNAL_ROUTER_RULES.get((org_group, svc))
+    if method is None:
+        return current_model, current_pred, "current", org_group
+
+    local_values=rate_values(pools.get("발주처+용역성격"), rate)
+    org_values=rate_values(pools.get("발주처"), rate)
+    service_values=rate_values(pools.get("용역성격"), rate)
+    global_values=rate_values(df_e, rate)
+    selected=(
+        local_values if len(local_values)>=3 else
+        org_values if len(org_values)>=3 else
+        service_values if len(service_values)>=3 else
+        global_values
+    )
+    if method=="bayes_shrink":
+        pred=bayesian_shrinkage(local_values or org_values, service_values, global_values, 10)
+        return method, pred, "routed", org_group
+    if method=="ar1_shrink":
+        center=bayesian_shrinkage(local_values, service_values, global_values, 10)
+        pred=ar1_shrink_prediction(selected, center, 10.0)
+        return method, pred, "routed", org_group
+    return current_model, current_pred, "current", org_group
+
+def analyze_improved_model(bid, df_c):
+    if df_c is None or len(df_c)==0: return None
+    svc=classify_service(bid.get("name",""), bid.get("industry",""))
+    rule=MODEL_RULES.get(svc, MODEL_RULES["_default"])
+    df_e=df_c if "_service" in df_c.columns else enrich_history(df_c)
+    candidates,pools=build_model_candidates(bid, df_e)
+    model_used,pred=pick_candidate(rule["model"], candidates)
+    if pred is None: return None
+    rate="예가/기초(0%)"
+    model_used,pred,route_type,org_group=choose_routed_company2(
+        bid.get("org",""),svc,model_used,pred,candidates,pools,df_e,rate
+    )
+    pred, recent_overlay_note = recent_volatility_overlay(bid, df_e, pred, rate)
+    basis_pool=pools.get("발주처+용역성격")
+    if basis_pool is None or len(basis_pool)<5:
+        basis_pool=pools.get("용역성격")
+    basis_n=len(basis_pool) if basis_pool is not None else len(df_e)
+    model_label=MODEL_LABELS.get(model_used, model_used)
+    svc_label=SERVICE_LABELS.get(svc, svc)
+    basis_text=(
+        f"{svc_label} 분류, {org_group} 구간의 최근2년 백테스트 개선조합({model_label}) 내부 적용"
+        if route_type=="routed"
+        else f"{svc_label} 분류 후 백테스트 최적모델({model_label}) 적용"
+    )
+    if recent_overlay_note:
+        basis_text += f"; {recent_overlay_note}"
+    return {
+        "pred":round(float(pred),4),
+        "service":svc,
+        "service_label":svc_label,
+        "model":model_used,
+        "model_label":model_label,
+        "mae":round(float(rule["mae"]),4),
+        "basis_n":int(basis_n),
+        "basis":basis_text,
+        "route_type":route_type,
+        "org_group":org_group,
+        "candidates":{k:round(float(v),4) for k,v in candidates.items() if v is not None},
+    }
+
+def rate_values(df, rate, tail=None):
+    """Return clean adjustment-rate values without raising when a filtered pool is empty."""
+    if df is None or len(df)==0 or rate not in getattr(df, "columns", []):
+        return []
+    ordered=history_sorted(df)
+    if ordered is None or len(ordered)==0 or rate not in ordered.columns:
+        return []
+    series=pd.to_numeric(ordered[rate], errors="coerce").dropna()
+    series=series[series.abs()<10]
+    if tail:
+        series=series.tail(tail)
+    return series.astype(float).tolist()
+
+
+def recent_window_frame(df, days=90):
+    """최근 N일 이력을 반환한다. 날짜가 없으면 빈 DataFrame을 반환한다."""
+    if df is None or len(df)==0:
+        return pd.DataFrame()
+    d=history_sorted(df).copy()
+    date_col=next((c for c in ["개찰일","입찰일","공고일","마감","투찰마감"] if c in d.columns), None)
+    if not date_col:
+        return pd.DataFrame()
+    d["_bt_dt"]=parse_date_series(d[date_col])
+    d=d[d["_bt_dt"].notna()].copy()
+    if len(d)==0:
+        return pd.DataFrame()
+    latest=d["_bt_dt"].max()
+    return d[d["_bt_dt"]>=latest-pd.Timedelta(days=days)].drop(columns=["_bt_dt"], errors="ignore")
+
+def recent_volatility_overlay(bid, df_e, pred, rate="예가/기초(0%)"):
+    """최근 90일 변동성과 방향성을 중심모델에 약하게 반영한다.
+    백테스트 보완사항: 최근 3개월 변동성이 커진 경우에도 과도하게 따라가지 않도록
+    최근평균 가중치를 낮추고, 최종값은 기존 표본의 5~95% 분위수 범위로 제한한다.
+    """
+    if df_e is None or len(df_e)==0 or rate not in getattr(df_e, "columns", []):
+        return round(float(pred),4), ""
+    org=str(bid.get("org",""))
+    svc=classify_service(bid.get("name",""), bid.get("industry",""))
+    base=df_e.copy()
+    if "_service" not in base.columns:
+        base=enrich_history(base)
+    pools=[]
+    if "발주기관" in base.columns and "_service" in base.columns:
+        pools.append(base[(base["발주기관"].astype(str)==org)&(base["_service"]==svc)])
+        pools.append(base[base["발주기관"].astype(str)==org])
+        pools.append(base[base["_service"]==svc])
+    pools.append(base)
+    pool=next((x for x in pools if x is not None and len(x)>=8), base)
+    all_vals=rate_values(pool, rate)
+    recent=recent_window_frame(pool, days=90)
+    recent_vals=rate_values(recent, rate)
+    if len(all_vals)<8 or len(recent_vals)<5:
+        return round(float(pred),4), ""
+    recent_mean=float(np.mean(recent_vals))
+    overall_mean=float(np.mean(all_vals))
+    recent_std=float(np.std(recent_vals))
+    drift=recent_mean-overall_mean
+    scope_info=classify_bid_scope(bid)
+    keep_legacy=(
+        is_electric_construction_bid(bid)
+        or (
+            scope_info.get("scope")=="지역제한"
+            and int(scope_info.get("company_count",3))==1
+        )
+    )
+    # 전기공사 및 한전 지역제한 1개사는 백테스트에서 대안 우위가 확인되지 않아
+    # v2.15.3 오버레이를 유지하고, 그 외에만 v2.15.4 보수 가중치를 적용한다.
+    if keep_legacy:
+        weight=0.12 if recent_std>=0.55 else 0.18
+        drift_weight=0.08
+        policy="v2.15.3 유지"
+    else:
+        weight=0.05 if recent_std>=0.55 else 0.10
+        drift_weight=0.04
+        policy="v2.15.4 보수화"
+    raw=(1-weight)*float(pred)+weight*recent_mean+drift_weight*drift
+    adjusted=quantile_clip_value(raw, all_vals)
+    clipped=not np.isclose(float(raw),float(adjusted),rtol=0,atol=1e-12)
+    note=(
+        f"최근90일 오버레이({policy}, 기준표본 n={len(all_vals)}, 최근 n={len(recent_vals)}, "
+        f"평균 {recent_mean:+.4f}%, 변동성 {recent_std:.4f}, 최근가중 {weight:.2f}, "
+        f"drift {drift:+.4f}%p×{drift_weight:.2f}, "
+        f"5~95% 제한 {'적용' if clipped else '미적용'})"
+    )
+    return round(float(adjusted),4), note
+
+def apply_single_local_correction(rec, scope_info, df_bid):
+    """경북·대구 등 한전 감리 지역제한 1개사 추천 전용 보정.
+    1개사만 참여하는 경우 분산 효과가 없으므로 업체2 중심값에 최근 3/5/10건
+    지역제한 이력을 일부 반영한다.
+    """
+    if not rec or not scope_info or not scope_info.get("applicable"):
+        return rec
+    if scope_info.get("scope")!="지역제한" or int(scope_info.get("company_count",3))!=1:
+        return rec
+    vals=rate_values(df_bid, "예가/기초(0%)")
+    if len(vals)<8:
+        item=dict(rec)
+        item["model_label"]="한전 지역제한 1개사"
+        item["basis_n"]=len(vals)
+        item["basis"]=(item.get("basis","")+"; 1개사 지역제한 보정은 표본 8건 미만으로 미적용").strip("; ")
+        return item
+    r3=float(np.mean(vals[-3:])) if len(vals)>=3 else float(np.mean(vals))
+    r5=float(np.mean(vals[-5:])) if len(vals)>=5 else float(np.mean(vals))
+    r10=float(np.mean(vals[-10:])) if len(vals)>=10 else float(np.mean(vals))
+    recent_center=0.45*r3+0.35*r5+0.20*r10
+    recent_std=float(np.std(vals[-10:])) if len(vals)>=10 else float(np.std(vals))
+    weight=0.25 if recent_std>=0.55 else 0.35
+    raw=(1-weight)*float(rec["rate"])+weight*recent_center
+    adjusted=quantile_clip_value(raw, vals)
+    item=dict(rec)
+    item["rate"]=round(float(adjusted),4)
+    item["model"]="kepco_local_single"
+    item["model_label"]="한전 지역제한 1개사"
+    item["basis_n"]=len(vals)
+    item["basis"]=(
+        f"1개사 지역제한 보정: 업체2 중심값 {float(rec['rate']):+.4f}%에 "
+        f"최근 3/5/10건 가중평균 {recent_center:+.4f}%를 {weight:.0%} 반영"
+        f"(r3 {r3:+.4f}, r5 {r5:+.4f}, r10 {r10:+.4f}, 변동성 {recent_std:.4f}); "
+        f"기존근거: {rec.get('basis','')}"
+    )
+    return item
+
+
+def simple_region(value):
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return "지역미상"
+    parts=[p.strip() for p in re.split(r"[,/\s]+", str(value)) if p.strip()]
+    for p in parts:
+        if p!="전국":
+            return p
+    return "전국"
+
+def robust_rate_center(values):
+    vals=np.asarray([v for v in values if v is not None and np.isfinite(float(v)) and abs(float(v))<10], dtype=float)
+    if len(vals)==0:
+        return None
+    if len(vals)<5:
+        return float(np.mean(vals))
+    lo,hi=np.quantile(vals,[0.10,0.90])
+    trimmed=vals[(vals>=lo)&(vals<=hi)]
+    return float(0.60*np.median(vals)+0.40*np.mean(trimmed))
+
+def electric_construction_single_recommendation(bid, df_bid, base_rate):
+    """전기공사 + 1개사 참여 전용 단일 1순위 추천값.
+    동일 발주기관, 지역, 금액구간, 업체수구간, 최근 1년/90일 흐름을 가중혼합한다.
+    """
+    if df_bid is None or len(df_bid)==0:
+        return round(float(base_rate),4), "전기공사 단일추천: 전기공사 이력 부족으로 중심모델 유지"
+    rate="예가/기초(0%)"
+    d=df_bid.copy()
+    if "_service" not in d.columns:
+        d=enrich_history(d)
+    d=d[d["_service"]=="electric_construction"].copy()
+    if rate not in d.columns or len(d)<20:
+        return round(float(base_rate),4), "전기공사 단일추천: 전기공사 표본 20건 미만으로 중심모델 유지"
+    d[rate]=pd.to_numeric(d[rate], errors="coerce")
+    d=d[d[rate].notna() & (d[rate].abs()<10)].copy()
+    if len(d)<20:
+        return round(float(base_rate),4), "전기공사 단일추천: 유효 전기공사 표본 부족으로 중심모델 유지"
+    d=history_sorted(d)
+    d["_region_simple"]=d["지역"].apply(simple_region) if "지역" in d.columns else "지역미상"
+    d["_amount_bucket"]=d["기초금액"].apply(amount_bucket) if "기초금액" in d.columns else "금액미상"
+    d["_company_bucket"]=d["업체수"].apply(company_bucket) if "업체수" in d.columns else None
+    org=str(bid.get("org",""))
+    region=simple_region(bid.get("region",""))
+    amt=amount_bucket(bid.get("base",0))
+    comp=company_bucket(bid.get("companies", None))
+    items=[]
+    org_pool=d[d["발주기관"].astype(str)==org].tail(30) if "발주기관" in d.columns else d.iloc[0:0]
+    if len(org_pool)>=5:
+        items.append(("동일발주기관", robust_rate_center(org_pool[rate]), 0.35 if len(org_pool)>=10 else 0.25, len(org_pool)))
+    reg_pool=d[d["_region_simple"]==region].tail(50) if region!="지역미상" else d.iloc[0:0]
+    if len(reg_pool)>=8:
+        items.append(("동일지역", robust_rate_center(reg_pool[rate]), 0.20, len(reg_pool)))
+    amt_pool=d[d["_amount_bucket"]==amt].tail(80)
+    if len(amt_pool)>=10:
+        items.append(("금액구간", robust_rate_center(amt_pool[rate]), 0.20, len(amt_pool)))
+    comp_pool=d[d["_company_bucket"]==comp].tail(80)
+    if comp is not None and len(comp_pool)>=10:
+        items.append(("업체수구간", robust_rate_center(comp_pool[rate]), 0.10, len(comp_pool)))
+    date_col=next((c for c in ["개찰일","입찰일","공고일","마감","투찰마감"] if c in d.columns), None)
+    if date_col:
+        tmp=d.copy()
+        tmp["_dt"]=parse_date_series(tmp[date_col])
+        latest=tmp["_dt"].max()
+        recent365=tmp[tmp["_dt"]>=latest-pd.Timedelta(days=365)]
+        if len(recent365)>=20:
+            items.append(("최근1년", robust_rate_center(recent365[rate]), 0.20, len(recent365)))
+        recent90=tmp[tmp["_dt"]>=latest-pd.Timedelta(days=90)]
+        if len(recent90)>=10:
+            std=float(np.std(recent90[rate]))
+            w=0.10 if std>=0.55 else 0.15
+            items.append((f"최근90일(변동성 {std:.4f}, 가중 {w:.2f})", robust_rate_center(recent90[rate]), w, len(recent90)))
+    if not items:
+        items.append(("전기공사전체최근", robust_rate_center(d[rate].tail(100)), 1.0, min(len(d),100)))
+    vals=[]; weights=[]; notes=[]
+    for label,val,w,n in items:
+        if val is not None and np.isfinite(float(val)):
+            vals.append(float(val)); weights.append(w)
+            notes.append(f"{label} n={n}, 중심 {float(val):+.4f}%, 원가중 {w:.2f}")
+    if not vals:
+        return round(float(base_rate),4), "전기공사 단일추천: 산정 후보 부족으로 중심모델 유지"
+    pred=float(np.average(vals, weights=weights))
+    clip_vals=d[rate].tail(300).astype(float).to_numpy()
+    if len(clip_vals)>=20:
+        lo,hi=np.quantile(clip_vals,[0.05,0.95])
+        pred=float(np.clip(pred,lo,hi))
+    note="전기공사 단일 1순위 추천: " + "; ".join(notes[:6])
+    return round(float(pred),4), note
+
+def apply_single_electric_construction_correction(rec, bid, df_bid):
+    if not rec or not is_electric_construction_bid(bid or {}):
+        return rec
+    item=dict(rec)
+    adjusted,note=electric_construction_single_recommendation(bid, df_bid, item.get("rate",0))
+    item["rate"]=adjusted
+    item["role"]="전기공사 단일 1순위"
+    item["model"]="electric_construction_single"
+    item["model_label"]="전기공사 단일 1순위"
+    item["basis_n"]=int(len(df_bid)) if df_bid is not None else 0
+    item["basis"]=(note + "; 기준 중심값 " + f"{float(rec.get('rate',0)):+.4f}%")
+    return item
+
+def sign_transition_probability(df, rate):
+    """현재 부호 다음에 양수가 나온 비율을 최근 이력의 부호 전이로 계산한다."""
+    vals=rate_values(df, rate, tail=100)
+    if len(vals)<3:
+        return None
+    current_positive=vals[-1]>=0
+    next_signs=[
+        vals[i+1]>=0 for i in range(len(vals)-1)
+        if (vals[i]>=0)==current_positive
+    ]
+    if len(next_signs)<3:
+        next_signs=[v>=0 for v in vals[1:]]
+    if not next_signs:
+        return None
+    return {"p_positive":float(np.mean(next_signs)), "n":len(next_signs)}
+
+def company1_pattern_recommendation(org_df, service_df, rate, fallback):
+    """전체·분야 부호패턴으로 방향을 정하고 직전 2건 차이를 적용한다."""
+    org_stats=sign_transition_probability(org_df,rate)
+    svc_stats=sign_transition_probability(service_df,rate)
+    stats=[s for s in (org_stats,svc_stats) if s]
+    step_df=service_df if len(service_df)>=2 else org_df
+    step_vals=rate_values(step_df, rate, tail=2)
+    if not stats or len(step_vals)<2:
+        return round(float(fallback),4), "해당 발주처의 부호패턴 또는 직전 2건 이력이 부족하여 업체2 중심값 적용"
+
+    p_positive=float(np.mean([s["p_positive"] for s in stats]))
+    predicted_positive=p_positive>=0.5
+    previous,last=step_vals[-2],step_vals[-1]
+    gap=abs(last-previous)
+    candidate=last+gap if predicted_positive else last-gap
+    corrected=False
+    if predicted_positive and candidate<=0:
+        candidate=gap if gap>0 else abs(last)
+        corrected=True
+    elif not predicted_positive and candidate>=0:
+        candidate=-gap if gap>0 else -abs(last)
+        corrected=True
+
+    def prob_text(label,stat):
+        if not stat: return f"{label} 표본부족"
+        pos=stat["p_positive"]*100
+        return f"{label} 양수 {pos:.1f}%/음수 {100-pos:.1f}%(전이 {stat['n']}건)"
+
+    direction="양수" if predicted_positive else "음수"
+    operator="+" if predicted_positive else "-"
+    source="동일분야" if len(service_df)>=2 else "발주처전체"
+    correction="; 부호가 반대여서 예측 부호로 보정" if corrected else ""
+    range_note=""
+    org_vals=rate_values(org_df, rate)
+    if len(org_vals)>=10:
+        lower=float(np.quantile(org_vals,.05))
+        upper=float(np.quantile(org_vals,.95))
+        limited=float(np.clip(candidate,lower,upper))
+        if limited!=candidate:
+            range_note=f"; 발주처 5~95% 범위({lower:+.4f}~{upper:+.4f}%)로 제한"
+        candidate=limited
+    basis=(
+        f"{prob_text('전체',org_stats)}, {prob_text('관련분야',svc_stats)} → 다음 {direction}; "
+        f"{source} 직전2건 {previous:+.4f}%/{last:+.4f}%, 차이 {gap:.4f}%p를 최신값에 {operator} 적용"
+        f"{correction}{range_note}"
+    )
+    return round(float(candidate),4),basis
+
+def movement_label(delta):
+    if delta>0.0001: return "상승"
+    if delta<-0.0001: return "하락"
+    return "보합"
+
+def trend_label(values):
+    sample=np.asarray(values[-5:],dtype=float)
+    if len(sample)<2: return "보합"
+    slope=float(np.polyfit(np.arange(len(sample)),sample,1)[0])
+    if slope>0.005: return "상승"
+    if slope<-0.005: return "하락"
+    return "보합"
+
+def pattern_at(values,idx):
+    start=max(0,idx-4)
+    return {
+        "movement":movement_label(values[idx]-values[idx-1]),
+        "sign":"양수" if values[idx]>=0 else "음수",
+        "trend":trend_label(values[start:idx+1]),
+    }
+
+def company3_line_recommendation(org_df, rate, fallback, step=0.02):
+    """발주처 전체에서 같은 직전패턴 뒤 결과를 0.02 라인으로 집계한다."""
+    vals=rate_values(org_df, rate)
+    if len(vals)<6:
+        return round(float(fallback),4), "해당 발주처 이력이 6건 미만이어서 업체2 중심값 적용"
+
+    current=pattern_at(vals,len(vals)-1)
+    profiles=[(i,pattern_at(vals,i)) for i in range(1,len(vals)-1)]
+    levels=[
+        ("상하·음양·추세 일치",lambda p:p==current),
+        ("상하·음양 일치",lambda p:p["movement"]==current["movement"] and p["sign"]==current["sign"]),
+        ("음양 일치",lambda p:p["sign"]==current["sign"]),
+        ("전체 패턴",lambda p:True),
+    ]
+    match_label="전체 패턴"; next_values=[]
+    for label,matcher in levels:
+        selected=[vals[i+1] for i,p in profiles if matcher(p)]
+        if len(selected)>=3 or label=="전체 패턴":
+            match_label=label; next_values=selected; break
+
+    line_keys=[int(round(v/step)) for v in next_values]
+    counts=pd.Series(line_keys).value_counts()
+    max_count=int(counts.max())
+    top_keys=[int(k) for k,v in counts.items() if int(v)==max_count]
+    recent_diff=np.diff(np.asarray(vals[-5:],dtype=float))
+    target=vals[-1]+(float(np.median(recent_diff)) if len(recent_diff) else 0.0)
+    selected_key=min(top_keys,key=lambda k:abs(k*step-target))
+    selected_line=round(selected_key*step,4)
+    basis=(
+        f"발주처 전체 {len(vals)}건을 {step:.4f}%p 라인으로 집계; "
+        f"직전패턴 {current['movement']}·{current['sign']}·{current['trend']}추세, "
+        f"{match_label} {len(next_values)}건 중 {selected_line:+.4f}% 라인 {max_count}건으로 최다"
+    )
+    return selected_line,basis
+
+def build_company_recommendations(bid, improved, a1, a2, a3, df_c):
+    """업체1 부호패턴, 업체2 백테스트 중심값, 업체3 0.02 라인패턴으로 추천한다."""
+    if df_c is None or len(df_c)==0:
+        return None
+    df_e=df_c if "_service" in df_c.columns else enrich_history(df_c)
+    rate="예가/기초(0%)"
+    if rate not in df_e.columns:
+        return None
+    svc=classify_service(bid.get("name",""), bid.get("industry",""))
+    org=str(bid.get("org",""))
+    valid=df_e.copy()
+    valid[rate]=pd.to_numeric(valid[rate], errors="coerce")
+    valid=valid[valid[rate].notna() & (valid[rate].abs()<10)].copy()
+    org_df=valid[valid["발주기관"].astype(str)==org] if "발주기관" in valid.columns else valid.iloc[0:0]
+    service_df=org_df[org_df["_service"]==svc] if "_service" in org_df.columns else valid.iloc[0:0]
+    pools=[
+        ("동일 발주처·동일 분야", service_df),
+        ("동일 발주처", org_df),
+        ("동일 분야", valid[valid["_service"]==svc] if "_service" in valid.columns else valid.iloc[0:0]),
+        ("전체 낙찰이력", valid),
+    ]
+    pool_label,pool=next(((label,data) for label,data in pools if len(data)>=8), pools[-1])
+    if len(pool)==0:
+        return None
+    recent=history_sorted(pool).tail(100)
+    fallback=[x["pred"] for x in (a1,a2,a3) if x]
+    center=float(improved["pred"]) if improved else float(np.mean(fallback)) if fallback else float(recent[rate].median())
+    center_basis=(
+        f"중심모델: {improved['basis']}, 근거 {improved['basis_n']}건"
+        if improved else f"중심모델: ①패턴·②유사표본·③트렌드의 사용 가능한 분석값 평균"
+    )
+    company1,company1_basis=company1_pattern_recommendation(
+        org_df,service_df,rate,center
+    )
+    company3,company3_basis=company3_line_recommendation(
+        org_df,rate,center
+    )
+    center_model=(improved or {}).get("model","fallback_mean")
+    center_model_label=(improved or {}).get("model_label","사용 가능한 분석값 평균")
+    center_basis_n=int((improved or {}).get("basis_n",len(recent)))
+    return [
+        {
+            "company":"업체 1", "rate":company1, "role":"방향성 헷지",
+            "model":"direction_hedge", "model_label":"방향성 헷지",
+            "basis_n":max(len(org_df),len(service_df)), "basis":"방향성 헷지: "+company1_basis,
+        },
+        {
+            "company":"업체 2", "rate":round(center,4), "role":"중심모델",
+            "model":center_model, "model_label":center_model_label,
+            "basis_n":center_basis_n, "basis":center_basis,
+        },
+        {
+            "company":"업체 3", "rate":company3, "role":"라인 헷지",
+            "model":"line_hedge", "model_label":"0.02%p 라인 헷지",
+            "basis_n":len(org_df), "basis":"라인 헷지: "+company3_basis,
+        },
+    ]
+
+def apply_company_count(recommendations, scope_info, df_bid=None, bid=None):
+    """입찰 참여 가능 업체 수에 맞춰 추천값을 선택하고 업체 번호를 다시 매긴다."""
+    recs=list(recommendations or [])
+    if not recs:
+        return []
+    company_count=int((scope_info or {}).get("company_count",3))
+    if company_count<=1:
+        # 1개사만 참여할 때는 업체2 중심모델을 기본으로 사용한다.
+        # 전기공사는 전용 단일 1순위 모델, 한전 지역제한은 지역제한 최근흐름 보정을 적용한다.
+        base_rec=recs[1] if len(recs)>1 else recs[0]
+        if is_electric_construction_bid(bid or {}):
+            chosen=[apply_single_electric_construction_correction(base_rec, bid, df_bid)]
+        else:
+            chosen=[apply_single_local_correction(base_rec, scope_info, df_bid)]
+    elif company_count==2:
+        # 2개사 참여 시 방향성 헷지와 중심모델을 사용한다.
+        chosen=recs[:2]
+    else:
+        # 3개사 참여 시 방향성 헷지·중심모델·라인 헷지를 모두 사용한다.
+        chosen=recs[:3]
+    result=[]
+    for pos,rec in enumerate(chosen,1):
+        item=dict(rec)
+        item["company"]=f"업체 {pos}"
+        result.append(item)
+    return result
+
+def parse_lower_limit_rate(value):
+    """입찰서류함 낙찰하한율을 퍼센트 숫자(예: 89.745)로 정규화한다."""
+    if value is None:
+        return None
+    try:
+        if isinstance(value, str):
+            text=value.strip().replace(",", "")
+            if not text:
+                return None
+            had_percent="%" in text
+            text=text.replace("%", "").strip()
+            number=float(text)
+            if not had_percent and 0 < abs(number) <= 1:
+                number*=100
+        else:
+            number=float(value)
+            if not np.isfinite(number):
+                return None
+            if 0 < abs(number) <= 1:
+                number*=100
+        if not np.isfinite(number) or number <= 0 or number > 100:
+            return None
+        return round(float(number),6)
+    except (TypeError,ValueError):
+        return None
+
+
+def parse_xls(file_bytes, filename=""):
+    """입찰서류함 파일 파싱 — xls/xlsx 모두 지원"""
+    bids = []
+    # ── xlsx 형식 ────────────────────────────────────────────
+    is_xlsx = filename.lower().endswith(".xlsx") if filename else False
+    if not is_xlsx:
+        try:
+            # xlsx 매직바이트 확인 (PK = zip 헤더)
+            is_xlsx = file_bytes[:2] == b'PK'
+        except Exception:
+            is_xlsx = False
+
+    if is_xlsx:
+        import openpyxl
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
+        ws = wb.active
+        rows_data = list(ws.iter_rows(values_only=True))
+        wb.close()
+        if len(rows_data) < 3:
+            return bids
+        headers = [str(c) if c is not None else "" for c in rows_data[1]]
+        for row_vals in rows_data[2:]:
+            row = {headers[i]: row_vals[i] for i in range(len(headers))}
+            if not row.get("번호"):
+                continue
+            try:
+                base = float(row.get("기초금액") or 0)
+            except (ValueError, TypeError):
+                base = 0
+            bids.append({
+                "no":       int(float(row["번호"])),
+                "name":     str(row.get("공고명") or ""),
+                "bid_no":   str(row.get("공고번호") or ""),
+                "base":     base,
+                "base_억":  round(base/1e8, 4) if base else 0,
+                "deadline": str(row.get("투찰마감") or ""),
+                "org":      str(row.get("발주기관") or ""),
+                "region":   str(row.get("지역") or ""),
+                "industry": str(row.get("업종") or row.get("참가가능업종") or ""),
+                "companies": row.get("업체수") or row.get("참가업체수") or None,
+                "lower_limit_rate": parse_lower_limit_rate(row.get("낙찰하한율")),
+            })
+    else:
+        # ── xls 형식 (나라장터 기본) ──────────────────────────
+        wb = xlrd.open_workbook(file_contents=file_bytes, ignore_workbook_corruption=True)
+        ws = wb.sheets()[0]
+        headers = [ws.cell_value(1, c) for c in range(ws.ncols)]
+        for r in range(2, ws.nrows):
+            row = {headers[c]: ws.cell_value(r, c) for c in range(ws.ncols)}
+            if not row.get("번호"):
+                continue
+            base = float(row.get("기초금액") or 0)
+            bids.append({
+                "no":       int(row["번호"]),
+                "name":     row.get("공고명", ""),
+                "bid_no":   row.get("공고번호", ""),
+                "base":     base,
+                "base_억":  round(base/1e8, 4) if base else 0,
+                "deadline": row.get("투찰마감", ""),
+                "org":      row.get("발주기관", ""),
+                "region":   row.get("지역", ""),
+                "industry": row.get("업종", row.get("참가가능업종", "")),
+                "companies": row.get("업체수", row.get("참가업체수", None)),
+                "lower_limit_rate": parse_lower_limit_rate(row.get("낙찰하한율")),
+            })
+    return bids
+
+# ── 영문 변환 ─────────────────────────────────────────────────
+def tr_trend(t):
+    return {"↑상승":"Up","↓하락":"Down","→횡보":"Flat"}.get(t,t)
+def tr_pattern(p):
+    return {"연속성":"Momentum","반전":"Reversal","무작위":"Random"}.get(p,p)
+def tr_org(org):
+    return (org.replace("한국전력공사 ","KEPCO ").replace("본부","")
+               .replace("한국철도공사 회계통합센터","KORAIL")
+               .replace("조달청","PPS").replace("국군재정관리단","MND"))
+
+# ── 흐름 차트 ─────────────────────────────────────────────────
+def make_flow_chart(a1,a2,a3,lo,hi,org_raw,three_pt=None):
+    all_v=(a1.get("all_vals") or a1.get("recent10",[])) if a1 else []
+    if not all_v: return None
+    org_en=tr_org(org_raw)
+    show_n=min(30,len(all_v)); recent=all_v[-show_n:]
+    x=np.arange(1,show_n+1); next_x=show_n+1; mean_v=a1["mean"]
+
+    fig=plt.figure(figsize=(13,5.5),facecolor="#f8fafc")
+    gs=fig.add_gridspec(2,1,height_ratios=[2.6,1.0],hspace=0.04)
+    ax=fig.add_subplot(gs[0]); ax_l=fig.add_subplot(gs[1])
+    ax.set_facecolor("#ffffff"); ax_l.set_facecolor("#f8fafc"); ax_l.axis("off")
+
+    ax.axhline(0,color="#94a3b8",lw=1.0,alpha=0.8,zorder=1)
+    if lo is not None and hi is not None:
+        ax.axhspan(lo,hi,alpha=0.12,color="#7c3aed",zorder=1)
+        ax.axhline(lo,color="#7c3aed",lw=0.7,ls=":",alpha=0.5,zorder=1)
+        ax.axhline(hi,color="#7c3aed",lw=0.7,ls=":",alpha=0.5,zorder=1)
+    ax.axhline(mean_v,color="#f59e0b",lw=1.3,ls="--",alpha=0.85,zorder=2)
+    ma5=[np.mean(recent[max(0,i-4):i+1]) for i in range(show_n)]
+    ax.plot(x,ma5,color="#6366f1",lw=1.6,ls="--",alpha=0.75,zorder=3)
+    bar_c=["#10b981" if v>=0 else "#ef4444" for v in recent]
+    ax.bar(x,recent,color=bar_c,alpha=0.42,width=0.65,zorder=2)
+    ax.plot(x,recent,color="#1a2744",lw=1.6,marker="o",ms=3.5,zorder=4)
+    for i in range(max(0,show_n-10),show_n):
+        v=recent[i]
+        ax.annotate(f"{v:+.3f}",xy=(x[i],v),xytext=(0,7 if v>=0 else -11),
+                    textcoords="offset points",ha="center",fontsize=6.5,
+                    color="#059669" if v>=0 else "#dc2626",fontweight="bold")
+    ax.axvline(show_n+0.5,color="#7c3aed",lw=1.4,ls=":",alpha=0.75)
+
+    # 3포인트 표시
+    if three_pt:
+        pts=[
+            ("A",three_pt["pt_a"],"#991b1b","v",10),
+            ("B",three_pt["pt_b"],"#1d4ed8","D",11),
+            ("C",three_pt["pt_c"],"#15803d","^",10),
+        ]
+        xoff=[-0.35,0.0,0.35]
+        for idx,(lbl,pv,pc,mk,ms) in enumerate(pts):
+            px=next_x+xoff[idx]
+            ax.plot([px],[pv],color=pc,marker=mk,ms=ms,zorder=7,
+                    markeredgecolor="white",markeredgewidth=1.2)
+            ax.annotate(f"{lbl}:{pv:+.4f}%",xy=(px,pv),xytext=(22,0),
+                        textcoords="offset points",ha="left",fontsize=8,
+                        color=pc,fontweight="bold",
+                        arrowprops=dict(arrowstyle="->",color=pc,lw=1.1))
+        # 커버율 표시
+        cover_txt=f"Cover:{three_pt['cover']}%"
+        if three_pt['cover_r']>0: cover_txt+=f"(R:{three_pt['cover_r']}%)"
+        ax.text(next_x+2.5,ax.get_ylim()[1]*0.9,cover_txt,
+                fontsize=8,color="#7c3aed",fontweight="bold",ha="center",
+                bbox=dict(boxstyle="round,pad=0.3",fc="#f3e8ff",ec="#7c3aed",alpha=0.85))
+    else:
+        preds=[]
+        if a1: preds.append(("(1)Pattern",a1["pred"],"#1d4ed8","D",10))
+        if a2: preds.append(("(2)Similar",a2["pred"],"#15803d","s",10))
+        if a3: preds.append(("(3)Trend",  a3["pred"],"#92400e","^",10))
+        xoff=[-0.32,0.0,0.32]
+        for idx,(lbl,pv,pc,mk,ms) in enumerate(preds):
+            px=next_x+xoff[idx]
+            ax.plot([px],[pv],color=pc,marker=mk,ms=ms,zorder=7,
+                    markeredgecolor="white",markeredgewidth=1.1)
+            ax.annotate(f"{pv:+.4f}%",xy=(px,pv),xytext=(20,0),
+                        textcoords="offset points",ha="left",fontsize=8,color=pc,
+                        fontweight="bold",arrowprops=dict(arrowstyle="->",color=pc,lw=1.1))
+
+    if lo is not None and hi is not None:
+        bx=next_x+1.3
+        ax.annotate("",xy=(bx,lo),xytext=(bx,hi),
+                    arrowprops=dict(arrowstyle="<->",color="#7c3aed",lw=2.0))
+        ax.text(bx+0.15,(lo+hi)/2,f"Rec.\n{lo:+.4f}\n~{hi:+.4f}",
+                fontsize=7.5,color="#7c3aed",fontweight="bold",va="center",ha="left",
+                bbox=dict(boxstyle="round,pad=0.3",fc="#f3e8ff",ec="#7c3aed",alpha=0.9))
+
+    ax_r=ax.twinx(); ax_r.set_ylim(ax.get_ylim())
+    tks=[mean_v]; tlbls=[f"Avg:{mean_v:+.3f}"]
+    if lo is not None: tks+=[lo,hi]; tlbls+=[f"Lo:{lo:+.3f}",f"Hi:{hi:+.3f}"]
+    ax_r.set_yticks(tks); ax_r.set_yticklabels(tlbls,fontsize=7,color="#64748b")
+    ax.set_xlim(0.3,next_x+2.8)
+    ax.set_xticks(list(x)+[next_x])
+    ax.set_xticklabels([f"-{show_n-i}" for i in range(show_n)]+["Pred"],fontsize=7)
+    ax.set_ylabel("Pred/Base(0%) %",fontsize=8)
+    ax.tick_params(labelsize=7.5); ax.grid(axis="y",alpha=0.18,ls="--")
+    grade=a1.get("grade","?"); mae=a1.get("mae",0)
+    ax.set_title(
+        f"{org_en}  |  Last {show_n} results  |  Trend:{tr_trend(a1['trend'])}"
+        f"  |  Pattern:{tr_pattern(a1['pattern'])}  |  n={a1['n']}"
+        f"  |  Grade:{grade}(MAE:{mae:.3f}%)",
+        fontsize=9,fontweight="bold",color="#1a2744",pad=8)
+
+    # 범례 패널
+    ax_l.set_xlim(0,1); ax_l.set_ylim(0,1)
+    ax_l.add_patch(mpatches.FancyBboxPatch(
+        (0.005,0.03),0.990,0.94,boxstyle="round,pad=0.01",
+        facecolor="#ffffff",edgecolor="#cbd5e1",linewidth=1.0,
+        transform=ax_l.transAxes))
+    col_defs=[(0.01,"Chart Legend","#1d4ed8"),(0.265,"Prediction","#15803d"),
+              (0.515,"Pattern Detail","#7c3aed"),(0.765,"3-Point Strategy","#991b1b")]
+    for cx,htxt,hcol in col_defs:
+        ax_l.add_patch(mpatches.FancyBboxPatch(
+            (cx+0.002,0.80),0.238,0.16,boxstyle="round,pad=0.005",
+            facecolor=hcol,alpha=0.12,edgecolor="none",transform=ax_l.transAxes))
+        ax_l.text(cx+0.012,0.885,htxt,fontsize=9,fontweight="bold",
+                  color=hcol,va="center",transform=ax_l.transAxes)
+    for lx in [0.255,0.505,0.755]:
+        ax_l.plot([lx,lx],[0.04,0.97],color="#e2e8f0",lw=1.0,transform=ax_l.transAxes)
+
+    a2n=a2["n"] if a2 else "-"
+    grade_color={"A":"#15803d","B":"#1d4ed8","C":"#854d0e","D":"#991b1b"}.get(grade,"#475569")
+    tp=three_pt or {}
+    items=[
+        (0.01,"line","#1a2744","","Actual bid result",  f"Last {show_n} results"),
+        (0.01,"line","#6366f1","","Moving Avg MA(5)",    "5-case moving average"),
+        (0.01,"line","#f59e0b","","Overall Average",     f"Avg:{mean_v:+.4f}%"),
+        (0.01,"band","#7c3aed","","Recommended Zone",    f"{lo:+.4f}%~{hi:+.4f}%" if lo else "-"),
+        (0.265,"mark","#1d4ed8","D","(1) Pattern",       f"w={a1['w5']}/{a1['w10']}/{a1['wm']} -> {a1['pred']:+.4f}%"),
+        (0.265,"mark","#15803d","s","(2) Similar",       f"n={a2n} -> {a2['pred']:+.4f}%" if a2 else "No data"),
+        (0.265,"mark","#92400e","^","(3) Trend",         f"{a3['pred']:+.4f}%" if a3 else "No data"),
+        (0.515,"dot",grade_color,"","Accuracy Grade",    f"Grade:{grade} MAE:{mae:.3f}%"),
+        (0.515,"dot","#7c3aed","","Last 5 avg (r5)",     f"{a1['r5']:+.4f}%"),
+        (0.515,"dot","#7c3aed","","Last 10 avg (r10)",   f"{a1['r10']:+.4f}%"),
+        (0.765,"mark","#991b1b","v","Co.A (음수/헷지)",  f"{tp.get('pt_a',0):+.2f}%"),
+        (0.765,"mark","#1d4ed8","D","Co.B (차트예측)",   f"{tp.get('pt_b',0):+.4f}%"),
+        (0.765,"mark","#15803d","^","Co.C (양수/헷지)",  f"{tp.get('pt_c',0):+.2f}%  Cover:{tp.get('cover',0)}%"),
+    ]
+    row_cnt={0.01:0,0.265:0,0.515:0,0.765:0}
+    TOP_Y=0.72; ROW_GAP=0.225
+    for (cx,itype,color,mk,label,desc) in items:
+        ri=row_cnt[cx]; row_cnt[cx]+=1; y=TOP_Y-ri*ROW_GAP
+        if itype=="line":
+            ax_l.plot([cx+0.005,cx+0.038],[y+0.05,y+0.05],color=color,lw=2.4,
+                      transform=ax_l.transAxes,clip_on=False)
+        elif itype=="band":
+            ax_l.add_patch(mpatches.FancyBboxPatch(
+                (cx+0.005,y+0.02),0.033,0.065,boxstyle="round,pad=0.003",
+                facecolor=color,alpha=0.28,edgecolor=color,linewidth=1.1,
+                transform=ax_l.transAxes))
+        elif itype in ("mark","dot"):
+            ms_val=9 if itype=="mark" else 5.5
+            ax_l.plot([cx+0.022],[y+0.05],marker=mk if itype=="mark" else "o",
+                      color=color,ms=ms_val,transform=ax_l.transAxes,clip_on=False,
+                      markeredgecolor="white" if itype=="mark" else color,
+                      markeredgewidth=1.3 if itype=="mark" else 0,alpha=0.75 if itype=="dot" else 1)
+        ax_l.text(cx+0.048,y+0.100,label,fontsize=8.5,fontweight="bold",
+                  color="#1e293b",va="top",transform=ax_l.transAxes)
+        ax_l.text(cx+0.048,y+0.005,desc,fontsize=8,color="#475569",
+                  va="top",transform=ax_l.transAxes)
+    ax_l.plot([0.01,0.99],[0.045,0.045],color="#e2e8f0",lw=0.8,transform=ax_l.transAxes)
+    plt.subplots_adjust(left=0.055,right=0.92,top=0.95,bottom=0.02)
+    buf=io.BytesIO()
+    plt.savefig(buf,format="png",dpi=140,bbox_inches="tight",facecolor="#f8fafc")
+    buf.seek(0); plt.close(); return buf
+
+def simple_flow_data(df_c, bid, max_n=20):
+    if df_c is None or len(df_c)==0: return None
+    d=history_for_bid(bid,df_c)
+    if len(d)==0 or "예가/기초(0%)" not in d.columns: return None
+    org=str(bid.get("org",""))
+    svc=classify_service(bid.get("name",""), bid.get("industry",""))
+    org_df=d[d["발주기관"].astype(str)==org] if "발주기관" in d.columns else d.iloc[0:0]
+    family=model_family_info(bid)[0]
+    svc_df=org_df[(org_df["_service"]==svc)&(org_df["_family"]==family)] if "_service" in org_df.columns else d.iloc[0:0]
+    svc_scope="해당 발주처 내 해당분야"
+    svc_chart_scope="Same agency service"
+    if len(svc_df)<3 and "_service" in d.columns:
+        svc_df=d[(d["_service"]==svc)&(d["_family"]==family)]
+        svc_scope="전체 발주처 해당분야"
+        svc_chart_scope="All agencies service"
+    org_vals=org_df["예가/기초(0%)"].dropna().astype(float).tail(max_n).to_list()
+    svc_vals=svc_df["예가/기초(0%)"].dropna().astype(float).tail(max_n).to_list()
+    if len(org_vals)==0 and len(svc_vals)==0: return None
+    return {
+        "org_label":"해당 발주처 전체",
+        "svc_label":svc_scope,
+        "service_label":model_family_info(bid)[1]+" / "+SERVICE_LABELS.get(svc,svc),
+        "org_chart_label":"Agency all",
+        "svc_chart_label":svc_chart_scope,
+        "service_chart_label":SERVICE_CHART_LABELS.get(svc,svc),
+        "org_vals":org_vals,
+        "svc_vals":svc_vals,
+        "org_n":int(len(org_df)),
+        "svc_n":int(len(svc_df)),
+    }
+
+def make_simple_flow_chart(df_c, bid, max_n=20):
+    data=simple_flow_data(df_c,bid,max_n=max_n)
+    if not data: return None, None
+    fig,axes=plt.subplots(2,1,figsize=(12,5.8),facecolor="#ffffff",sharex=False)
+    fig.suptitle(
+        f"Adjustment Rate Trend - Agency vs {data['service_chart_label']}",
+        fontsize=9,fontweight="bold",color="#1f2937",y=0.97
+    )
+
+    def draw(ax,vals,label,color,marker):
+        ax.set_facecolor("#ffffff")
+        ax.axhline(0,color="#94a3b8",lw=1.0,alpha=0.9)
+        ax.set_title(label,fontsize=8,fontweight="bold",color=color,loc="left",pad=4)
+        ax.grid(axis="y",alpha=0.22,ls="--")
+        ax.tick_params(labelsize=7)
+        ax.set_ylabel("Rate (%)",fontsize=7)
+        if not vals:
+            ax.text(0.5,0.5,"No data",transform=ax.transAxes,ha="center",va="center",
+                    fontsize=7,color="#64748b")
+            return
+        x=np.arange(1,len(vals)+1)
+        ax.plot(x,vals,color=color,lw=1.9,marker=marker,ms=4.5)
+        ax.scatter([x[-1]],[vals[-1]],s=50,color=color,zorder=5,edgecolor="white",linewidth=1.0)
+        for idx,(xi,yi) in enumerate(zip(x,vals)):
+            if idx==0:
+                delta_txt="base"
+            else:
+                delta_txt=f"{yi-vals[idx-1]:+.4f}"
+            yoff=9 if yi>=0 else -11
+            va="bottom" if yi>=0 else "top"
+            ax.annotate(f"{yi:+.4f}\n({delta_txt})",xy=(xi,yi),xytext=(0,yoff),
+                        textcoords="offset points",ha="center",va=va,
+                        fontsize=5.5,color=color,fontweight="bold")
+        ax.margins(x=0.03,y=0.34)
+
+    draw(axes[0],data["org_vals"],f"{data['org_chart_label']} (n={len(data['org_vals'])})","#2563eb","o")
+    draw(axes[1],data["svc_vals"],f"{data['svc_chart_label']} (n={len(data['svc_vals'])})","#16a34a","s")
+    axes[1].set_xlabel("Recent result order",fontsize=7)
+    fig.subplots_adjust(left=0.07,right=0.985,bottom=0.09,top=0.90,hspace=0.38)
+    buf=io.BytesIO()
+    plt.savefig(buf,format="png",dpi=140,facecolor="#ffffff")
+    buf.seek(0); plt.close()
+    return buf, data
+
+# ── 한전 세분화 함수 ──────────────────────────────────────────
+DIAG_KWS=['광학','초음파','VLF','PD','콘크리트']
+
+def is_kepco(org):
+    import bid_rules
+    return bid_rules.is_kepco(org)
+def is_diag(name): return any(kw in str(name) for kw in DIAG_KWS)
+def is_supervision(name): return '감리' in str(name)
+
+def _sector_vals(df_c, org_filter, name_kws):
+    if df_c is None: return np.array([])
+    mask = df_c['발주기관'].str.contains(org_filter, na=False)
+    kw_mask = pd.Series([False]*len(df_c), index=df_c.index)
+    for kw in name_kws: kw_mask = kw_mask | df_c['공고명'].str.contains(kw, na=False)
+    return df_c[mask & kw_mask]['예가/기초(0%)'].values
+
+def _sector_stat(vals, scope):
+    if len(vals)<3: return None
+    n=len(vals); m=float(np.mean(vals)); s=float(np.std(vals))
+    r5=float(np.mean(vals[-5:])) if n>=5 else m
+    r10=float(np.mean(vals[-10:])) if n>=10 else m
+    pred=0.25*r5+0.20*r10+0.55*m
+    return {"pred":round(pred,4),"mean":round(m,4),"std":round(s,4),
+            "r5":round(r5,4),"r10":round(r10,4),"n":n,
+            "all_vals":vals.tolist(),"recent10":[round(float(v),4) for v in vals[-10:]],
+            "conservative":round(pred-s*0.4,4),"aggressive":round(pred+s*0.4,4),
+            "scope":scope}
+
+def analyze_diag_all(df_c):
+    v=_sector_vals(df_c,'한국전력공사','|'.join(DIAG_KWS).split('|'))
+    return _sector_stat(v,'All KEPCO Diagnosis')
+
+def analyze_diag_org(org,df_c):
+    v=_sector_vals(df_c,org,DIAG_KWS)
+    return _sector_stat(v,f"{org.replace('한국전력공사 ','').replace('본부','')} Diagnosis")
+
+def analyze_sup_all(df_c):
+    v=_sector_vals(df_c,'한국전력공사',['감리'])
+    return _sector_stat(v,'All KEPCO Supervision')
+
+def analyze_sup_org(org,df_c):
+    v=_sector_vals(df_c,org,['감리'])
+    return _sector_stat(v,f"{org.replace('한국전력공사 ','').replace('본부','')} Supervision")
+
+def make_sector_chart(d_all,d_org,lo,hi,title):
+    datasets=[]
+    if d_all: datasets.append((d_all,d_all['scope'],'#1d4ed8'))
+    if d_org: datasets.append((d_org,d_org['scope'],'#dc2626'))
+    if not datasets: return None
+    ncols=len(datasets)
+    fig,axes=plt.subplots(1,ncols,figsize=(13,4.5),facecolor='#f8fafc',sharey=False)
+    if ncols==1: axes=[axes]
+    for ax,(data,scope,color) in zip(axes,datasets):
+        ax.set_facecolor('#ffffff')
+        vals=data.get('all_vals') or data.get('recent10',[])
+        show_n=min(30,len(vals)); recent=vals[-show_n:]
+        x=np.arange(1,show_n+1); mv=data['mean']; pv=data['pred']
+        ax.axhline(0,color='#94a3b8',lw=1.0,alpha=0.7,zorder=1)
+        ax.axhline(mv,color='#f59e0b',lw=1.3,ls='--',alpha=0.8,zorder=2)
+        if lo and hi: ax.axhspan(lo,hi,alpha=0.10,color='#7c3aed',zorder=1)
+        ma5=[np.mean(recent[max(0,i-4):i+1]) for i in range(show_n)]
+        ax.plot(x,ma5,color='#6366f1',lw=1.5,ls='--',alpha=0.7,zorder=3)
+        bar_c=[color if v>=0 else '#94a3b8' for v in recent]
+        ax.bar(x,recent,color=bar_c,alpha=0.38,width=0.65,zorder=2)
+        ax.plot(x,recent,color='#1a2744',lw=1.5,marker='o',ms=3.5,zorder=4)
+        for i in range(max(0,show_n-10),show_n):
+            v=recent[i]
+            ax.annotate(f'{v:+.3f}',xy=(x[i],v),xytext=(0,7 if v>=0 else -11),
+                        textcoords='offset points',ha='center',fontsize=6,
+                        color='#059669' if v>=0 else '#dc2626',fontweight='bold')
+        ax.axvline(show_n+0.5,color='#7c3aed',lw=1.2,ls=':',alpha=0.7)
+        ax.plot([show_n+1],[pv],marker='D',color='#7c3aed',ms=9,zorder=7,
+                markeredgecolor='white',markeredgewidth=1.2)
+        ax.annotate(f'{pv:+.4f}%',xy=(show_n+1,pv),xytext=(16,0),
+                    textcoords='offset points',ha='left',fontsize=8,color='#7c3aed',fontweight='bold',
+                    arrowprops=dict(arrowstyle='->',color='#7c3aed',lw=1))
+        ax.set_xlim(0.3,show_n+3.2)
+        ax.set_xticks(list(x)+[show_n+1])
+        ax.set_xticklabels([f'-{show_n-i}' for i in range(show_n)]+['Pred'],fontsize=7)
+        ax.set_ylabel('Pred/Base(0%) %',fontsize=8)
+        ax.tick_params(labelsize=7.5); ax.grid(axis='y',alpha=0.18,ls='--')
+        ax.set_title(f'{scope}  (n={data["n"]})',fontsize=9.5,fontweight='bold',color='#1a2744',pad=6)
+    fig.suptitle(title,fontsize=10,fontweight='bold',color='#1a2744',y=1.01)
+    plt.tight_layout(pad=0.8)
+    buf=io.BytesIO()
+    plt.savefig(buf,format='png',dpi=130,bbox_inches='tight',facecolor='#f8fafc')
+    buf.seek(0); plt.close(); return buf
+
+# ── 엑셀 생성 ─────────────────────────────────────────────────
+def make_excel(results):
+    from openpyxl import Workbook
+    from openpyxl.styles import Font,PatternFill,Alignment,Border,Side
+    from openpyxl.utils import get_column_letter
+    NAVY="FF1a2744";BLUE="FFdbeafe";GREEN="FFdcfce7";AMBER="FFfef9c3"
+    RED_L="FFfee2e2";PURP="FFf3e8ff";GRAY="FFf8fafc";RED2="FFfca5a5";GRN2="FFbbf7d0"
+    thin=Side(style="thin",color="FFd1d5db"); bdr=Border(left=thin,right=thin,top=thin,bottom=thin)
+    def H(ws,r,c,v,bg=NAVY,fg="FFFFFFFF",sz=10,bold=True,wrap=False):
+        cell=ws.cell(row=r,column=c,value=v)
+        cell.font=Font(name="맑은 고딕",bold=bold,color=fg,size=sz)
+        cell.fill=PatternFill("solid",start_color=bg)
+        cell.alignment=Alignment(horizontal="center",vertical="center",wrap_text=wrap)
+        cell.border=bdr; return cell
+    def C(ws,r,c,v,bg=None,bold=False,right=False,sz=10,color="FF1e293b",center=False,wrap=False):
+        cell=ws.cell(row=r,column=c,value=v)
+        cell.font=Font(name="맑은 고딕",bold=bold,size=sz,color=color)
+        ha="right" if right else ("center" if center else "left")
+        cell.alignment=Alignment(horizontal=ha,vertical="center",wrap_text=wrap)
+        cell.border=bdr
+        if bg: cell.fill=PatternFill("solid",start_color=bg)
+        return cell
+
+    wb=Workbook(); ws=wb.active; ws.title="투찰전략"; ws.sheet_view.showGridLines=False
+    today=datetime.now().strftime("%Y.%m.%d")
+    ws.merge_cells("A1:W1"); t=ws["A1"]
+    t.value=f"투찰전략 분석표 — {today}  ★ 백테스트 개선추천 + 3가지 분석값 + 3개업체 분산투찰 전략"
+    t.font=Font(name="맑은 고딕",bold=True,size=13,color="FF1a2744")
+    t.fill=PatternFill("solid",start_color="FFe0e7ff")
+    t.alignment=Alignment(horizontal="center",vertical="center")
+    ws.row_dimensions[1].height=30
+
+    hdrs=["No","공고번호","공고명","발주기관","기초금액(억)","마감",
+          "개선추천(%)","추천 사정율 하한(%)","추천 사정율 상한(%)","목표적중률",
+          "적용모델","용역성격","모델평균오차","추천근거",
+          "①패턴(%)","②유사표본(%)","③트렌드(%)","기존하한(%)","기존상한(%)",
+          "업체A(%)","업체B(%)","업체C(%)","커버율"]
+    wids=[5,18,44,20,10,12,12,14,14,10,22,12,12,34,10,10,10,10,10,10,10,10,8]
+    for i,(h,w) in enumerate(zip(hdrs,wids),1):
+        H(ws,2,i,h,wrap=True); ws.column_dimensions[get_column_letter(i)].width=w
+    ws.row_dimensions[2].height=36
+
+    for i,row in enumerate(results):
+        r=i+3; bg=GRAY if r%2==0 else "FFFFFFFF"
+        b=row["bid"]; a1=row["a1"]; a2=row["a2"]; a3=row["a3"]; im=row.get("improved")
+        lo,hi=row["range_lo"],row["range_hi"]; tp=row.get("three_pt")
+        C(ws,r,1,b["no"],bg=bg,bold=True,center=True)
+        C(ws,r,2,b.get("bid_no",""),bg=bg,sz=9,center=True)
+        C(ws,r,3,b["name"],bg=bg,sz=9,wrap=True)
+        C(ws,r,4,b["org"],bg=bg,sz=9)
+        if b["base"]>0:
+            cx=C(ws,r,5,b["base_억"],bg=bg,right=True); cx.number_format="#,##0.0000"
+        else: C(ws,r,5,"미정",bg=bg,center=True,sz=9)
+        C(ws,r,6,b["deadline"],bg=bg,sz=9,center=True)
+        if im:
+            for ci,key in [(7,"pred"),(8,"lo"),(9,"hi")]:
+                cx_im=C(ws,r,ci,im[key],bg=PURP,right=True,bold=True,color="FF7c3aed")
+                cx_im.number_format="+0.0000;-0.0000"
+            C(ws,r,10,f"{im['target_hit']}%",bg=PURP,center=True,bold=True,color="FF7c3aed")
+            C(ws,r,11,im["model_label"],bg=PURP,sz=9,wrap=True)
+            C(ws,r,12,im["service_label"],bg=PURP,center=True,sz=9)
+            cx_mae=C(ws,r,13,im["mae"],bg=PURP,right=True); cx_mae.number_format="0.0000"
+            C(ws,r,14,im["basis"],bg=PURP,sz=9,wrap=True)
+        else:
+            for ci in range(7,15): C(ws,r,ci,"-",bg=RED_L,center=True,sz=8)
+        for ci,a,cbg in [(15,a1,BLUE),(16,a2,GREEN),(17,a3,AMBER)]:
+            if a:
+                cx2=C(ws,r,ci,a["pred"],bg=cbg,right=True,bold=True,
+                      color="FF1d4ed8" if a["pred"]>=0 else "FF991b1b")
+                cx2.number_format="+0.0000;-0.0000"
+            else: C(ws,r,ci,"이력없음",bg=RED_L,center=True,sz=8)
+        for ci,val in [(18,lo),(19,hi)]:
+            if val is not None:
+                cx3=C(ws,r,ci,val,bg=PURP,right=True,bold=True,color="FF7c3aed")
+                cx3.number_format="+0.0000;-0.0000"
+            else: C(ws,r,ci,"-",bg=bg,center=True)
+        # 3포인트
+        if tp:
+            cx_a=C(ws,r,20,tp["pt_a"],bg=RED2,right=True,bold=True,color="FF991b1b")
+            cx_a.number_format="+0.00;-0.00"
+            cx_b=C(ws,r,21,tp["pt_b"],bg=BLUE,right=True,bold=True,color="FF1d4ed8")
+            cx_b.number_format="+0.0000;-0.0000"
+            cx_c=C(ws,r,22,tp["pt_c"],bg=GRN2,right=True,bold=True,color="FF15803d")
+            cx_c.number_format="+0.00;-0.00"
+            C(ws,r,23,f"{tp['cover']}%",bg=PURP,center=True,bold=True,color="FF7c3aed")
+        else:
+            for ci in [20,21,22,23]: C(ws,r,ci,"-",bg=bg,center=True)
+        ws.row_dimensions[r].height=34
+
+    # Sheet2: 3포인트 상세
+    ws2=wb.create_sheet("3포인트 전략"); ws2.sheet_view.showGridLines=False
+    ws2.merge_cells("A1:H1"); t2=ws2["A1"]
+    t2.value="3개 업체 분산투찰 전략표 — 30,614건 기반"
+    t2.font=Font(name="맑은 고딕",bold=True,size=12,color="FF1a2744")
+    t2.fill=PatternFill("solid",start_color="FFe0e7ff")
+    t2.alignment=Alignment(horizontal="center",vertical="center")
+    ws2.row_dimensions[1].height=28
+    hdrs2=["No","공고명","발주기관","기초금액","업체A포인트","업체B포인트(차트예측)","업체C포인트","커버율"]
+    wids2=[5,40,20,12,14,18,14,10]
+    for i,(h,w) in enumerate(zip(hdrs2,wids2),1):
+        H(ws2,2,i,h,wrap=True); ws2.column_dimensions[get_column_letter(i)].width=w
+    ws2.row_dimensions[2].height=30
+
+    for i,row in enumerate(results):
+        r=i+3; bg=GRAY if r%2==0 else "FFFFFFFF"
+        b=row["bid"]; tp=row.get("three_pt")
+        C(ws2,r,1,b["no"],bg=bg,center=True,bold=True)
+        C(ws2,r,2,b["name"][:55],bg=bg,sz=9,wrap=True)
+        C(ws2,r,3,b["org"],bg=bg,sz=9)
+        if b["base"]>0:
+            cx=C(ws2,r,4,b["base_억"],bg=bg,right=True); cx.number_format="#,##0.0000억"
+        else: C(ws2,r,4,"미정",bg=bg,center=True)
+        if tp:
+            pa=tp["pt_a"]; pb=tp["pt_b"]; pc_v=tp["pt_c"]
+            # 투찰금액
+            if b["base"]>0:
+                amt_a=int(b["base"]*(100+pa)/100)
+                amt_b=int(b["base"]*(100+pb)/100)
+                amt_c=int(b["base"]*(100+pc_v)/100)
+                cxa=C(ws2,r,5,f"{pa:+.2f}% ({amt_a:,}원)",bg=RED2,bold=True,color="FF991b1b",center=True)
+                cxb=C(ws2,r,6,f"{pb:+.4f}% ({amt_b:,}원)",bg=BLUE,bold=True,color="FF1d4ed8",center=True)
+                cxc=C(ws2,r,7,f"{pc_v:+.2f}% ({amt_c:,}원)",bg=GRN2,bold=True,color="FF15803d",center=True)
+            else:
+                C(ws2,r,5,f"{pa:+.2f}%",bg=RED2,bold=True,color="FF991b1b",center=True)
+                C(ws2,r,6,f"{pb:+.4f}%",bg=BLUE,bold=True,color="FF1d4ed8",center=True)
+                C(ws2,r,7,f"{pc_v:+.2f}%",bg=GRN2,bold=True,color="FF15803d",center=True)
+            cover_str=f"{tp['cover']}%"
+            if tp['cover_r']>0: cover_str+=f"\n최근:{tp['cover_r']}%"
+            C(ws2,r,8,cover_str,bg=PURP,bold=True,color="FF7c3aed",center=True,wrap=True)
+        else:
+            for ci in range(5,9): C(ws2,r,ci,"-",bg=bg,center=True)
+        ws2.row_dimensions[r].height=36
+    ws2.freeze_panes="A3"
+
+    buf=io.BytesIO(); wb.save(buf); buf.seek(0)
+    import ledger_metadata
+    return ledger_metadata.add_excel_metadata(buf,ledger_metadata.manifest())
+
+def recommendation_reference_amount(base_amount, rate):
+    """낙찰하한율을 반영하지 않은 추천 사정률 기준 예정가격 성격의 금액."""
+    try:
+        base=float(base_amount or 0)
+        return int(base*(100+float(rate))/100) if base>0 else None
+    except (TypeError,ValueError):
+        return None
+
+
+def model_family_info(bid):
+    import bid_rules
+    family=bid_rules.classify_model_family(bid.get("name",""),bid.get("industry",""),bid.get("org",""))
+    return family,bid_rules.MODEL_FAMILY_LABELS.get(family,"미분류")
+
+
+def final_recommendation_records(bid, prediction):
+    """Adapt final engine rates for screen/Excel; never apply a second correction."""
+    if prediction is not None and "selected_strategy" in prediction:
+        import bid_strategies
+        return bid_strategies.recommendation_records(bid,prediction)
+    import bid_engine
+    if prediction is None:
+        return []
+    rates=prediction.get("rates") or []
+    count=int(prediction["scope"]["company_count"])
+    if len(rates)!=count or any(not np.isfinite(float(rate)) for rate in rates):
+        raise ValueError("참여업체 수와 추천값을 확인할 수 없어 추천을 중단했습니다.")
+    family,family_label=model_family_info(bid)
+    strategy=prediction.get("strategy","current")
+    center_index=0 if count==1 else 1
+    replacement_index=(center_index if strategy.endswith("center") else
+                       0 if strategy=="interval_direction" else
+                       2 if strategy=="interval_line" else None)
+    roles=["단일 중심모델"] if count==1 else ["방향성 헷지","중심모델","라인 헷지"][:count]
+    records=[]
+    for index,(rate,role) in enumerate(zip(rates,roles)):
+        is_replacement=index==replacement_index
+        model=(strategy if is_replacement else prediction.get("model","current") if index==center_index
+               else "direction_hedge" if index==0 else "line_hedge")
+        label=(bid_engine.STRATEGY_LABELS.get(strategy,strategy) if is_replacement else
+               MODEL_LABELS.get(model,role) if index==center_index else role)
+        basis=(f"{family_label} / {bid.get('org','')} / 공고일 전일까지만 학습; "
+               f"{label}; {prediction['scope']['basis']}")
+        records.append({
+            "company":f"업체 {index+1}","rate":float(rate),
+            "role":role+(" · 대체분석" if is_replacement else ""),"model":model,"model_label":label,
+            "basis_n":int(prediction.get("prior_rows",0)),"basis":basis,
+            "family":family,"family_label":family_label,
+            "strategy":strategy,"alternative":bool(is_replacement),
+        })
+    return records
+
+
+def predict_final_for_bid(bid, history, policy=None):
+    import bid_engine
+    if history is None or len(history)==0:
+        return None,[]
+    prediction=bid_engine.recommend_bid(bid,history,policy)
+    return prediction,final_recommendation_records(bid,prediction)
+
+
+def predict_final_batch(bids, history, policy=None, strategy_mode=None):
+    """Build one local engine per batch; malformed announcement dates stay blank."""
+    if strategy_mode is not None:
+        import bid_strategies
+        predictions=bid_strategies.recommend_bids(bids,history,policy,mode=strategy_mode)
+        return [{"prediction":p,"recommendations":bid_strategies.recommendation_records(b,p),
+                 "error":(p or {}).get("error","")} for b,p in zip(bids,predictions)]
+    import bid_engine
+    import bid_rules
+    results=[{"prediction":None,"recommendations":[],"error":""} for _ in bids]
+    valid=[]
+    for index,bid in enumerate(bids):
+        if bid_rules.parse_date_value(bid.get("deadline")) is None:
+            results[index]["error"]="투찰마감일을 확인할 수 없어 추천하지 않습니다."
+        else:
+            valid.append(index)
+    if history is None or len(history)==0:
+        for index in valid:
+            results[index]["error"]="추천에 사용할 유효 낙찰이력이 없습니다."
+        return results
+    predictions=bid_engine.recommend_bids([bids[index] for index in valid],history,policy)
+    for index,prediction in zip(valid,predictions):
+        results[index]["prediction"]=prediction
+        results[index]["recommendations"]=final_recommendation_records(bids[index],prediction)
+        if prediction is None:
+            results[index]["error"]="해당 공고일 이전의 유효 낙찰이력이 부족합니다."
+    return results
+
+def recommendation_overlay_fields(rec):
+    basis=str((rec or {}).get("basis", ""))
+    recent_match=re.search(r"(?:최근 n|최근90일(?:\([^)]*\))? n)=(\d+)",basis)
+    std_match=re.search(r"변동성\s+([0-9.]+)",basis)
+    weight_match=re.search(r"(?:최근가중|가중)\s+([0-9.]+)",basis)
+    return {
+        "recent_n":int(recent_match.group(1)) if recent_match else None,
+        "recent_std":float(std_match.group(1)) if std_match else None,
+        "recent_weight":float(weight_match.group(1)) if weight_match else None,
+    }
+
+def make_excel_simple(results, quality=None):
+    """추천표와 향후 실제 낙찰성과를 누적할 사후검증 기록지를 내보낸다."""
+    audit_summary=load_audit_summary()
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    from openpyxl.worksheet.datavalidation import DataValidation
+    from openpyxl.formatting.rule import FormulaRule
+
+    wb=Workbook(); ws=wb.active; ws.title="업체별 추천"
+    ws.sheet_view.showGridLines=False
+    navy="FF1a2744"; fills=["FFfee2e2","FFdbeafe","FFdcfce7"]
+    thin=Side(style="thin",color="FFd1d5db")
+    border=Border(left=thin,right=thin,top=thin,bottom=thin)
+    headers=[
+        "No","공고번호","공고명","발주기관","용역분류","입찰범위","참여업체수",
+        "기초금액(원)","마감",
+    ]
+    widths=[6,20,44,28,14,18,12,18,15]
+    for pos in range(1,4):
+        headers.extend([
+            f"업체{pos} 추천사정률(%)",f"업체{pos} 추천기준금액(원)",
+            f"업체{pos} 적용모델",f"업체{pos} 기초이력수",f"업체{pos} 최근90일표본",
+            f"업체{pos} 최근90일변동성",f"업체{pos} 최근90일가중치",f"업체{pos} 산정근거",
+        ])
+        widths.extend([16,20,22,11,15,17,17,58])
+    headers.extend(["입찰판정근거","데이터품질경고","중심모델군","적용전략","모델버전"])
+    widths.extend([62,72,28,28,13])
+    ws.merge_cells(start_row=1,start_column=1,end_row=1,end_column=len(headers))
+    title=ws.cell(1,1,f"최대 3개 업체 추천 사정률·추천기준금액 — {MODEL_VERSION} / {datetime.now().strftime('%Y.%m.%d')}")
+    title.font=Font(name="맑은 고딕",bold=True,size=14,color="FFFFFFFF")
+    title.fill=PatternFill("solid",start_color=navy)
+    title.alignment=Alignment(horizontal="center",vertical="center")
+    ws.row_dimensions[1].height=30
+    for col,(header,width) in enumerate(zip(headers,widths),1):
+        cell=ws.cell(2,col,header)
+        cell.font=Font(name="맑은 고딕",bold=True,color="FFFFFFFF")
+        cell.fill=PatternFill("solid",start_color=navy)
+        cell.alignment=Alignment(horizontal="center",vertical="center",wrap_text=True)
+        cell.border=border
+        ws.column_dimensions[get_column_letter(col)].width=width
+    for idx,row in enumerate(results,3):
+        bid=row["bid"]; recs=row.get("recommendations") or []
+        scope_info=row.get("scope_info") or {}
+        company_count=int(scope_info.get("company_count",3))
+        is_scoped=bool(scope_info.get("applicable"))
+        service_label=SERVICE_LABELS.get(
+            classify_service(bid.get("name",""),bid.get("industry","")),"기타"
+        )
+        values=[
+            bid["no"],bid.get("bid_no",""),bid["name"],bid["org"],service_label,
+            scope_info.get("scope","기존분석"),company_count,
+            int(bid["base"]) if bid.get("base",0)>0 else None,bid["deadline"],
+        ]
+        for pos in range(3):
+            if pos<len(recs):
+                rec=recs[pos]
+                overlay=recommendation_overlay_fields(rec)
+                values.extend([
+                    float(rec["rate"]),recommendation_reference_amount(bid.get("base",0),rec["rate"]),
+                    rec.get("model_label",rec.get("role","")),int(rec.get("basis_n",0) or 0),
+                    overlay["recent_n"],overlay["recent_std"],overlay["recent_weight"],rec.get("basis",""),
+                ])
+            elif pos>=company_count:
+                values.extend(["참여대상 없음",None,"참여대상 없음",None,None,None,None,"참여대상 없음"])
+            else:
+                values.extend([None,None,"데이터 부족",None,None,None,None,"데이터 부족"])
+        row_warning=history_quality_warning(quality)
+        if row.get("error"):
+            row_warning=row["error"]+"; "+row_warning
+        if is_electric_construction_bid(bid) and simple_region(bid.get("region",""))=="지역미상":
+            row_warning="전기공사 지역 미상: 지역요소 제외·잔여가중치 재정규화; "+row_warning
+        scope_basis=(
+            f"입찰구분: {scope_info.get('scope','기존분석')} / "
+            f"참여업체: {company_count}개사 / "
+            f"적용근거: {scope_info.get('basis','기존 분석 기준')}"
+        )
+        family,family_label=model_family_info(bid)
+        strategy=row.get("prediction",{}).get("strategy","current") if row.get("prediction") else "current"
+        import bid_engine
+        values.extend([scope_basis,row_warning,family_label,bid_engine.STRATEGY_LABELS.get(strategy,strategy),MODEL_VERSION])
+        for col,value in enumerate(values,1):
+            cell=ws.cell(idx,col,value)
+            cell.font=Font(name="맑은 고딕",size=9)
+            cell.alignment=Alignment(horizontal="right" if isinstance(value,(int,float)) else "left",
+                                     vertical="center",wrap_text=True)
+            cell.border=border
+            for rec_pos,start_col in enumerate((10,18,26)):
+                if start_col<=col<=start_col+7:
+                    cell.fill=PatternFill("solid",start_color=fills[rec_pos])
+                if col==start_col and isinstance(value,(int,float)):
+                    cell.number_format="+0.0000;-0.0000"
+                elif col==start_col+1 and isinstance(value,(int,float)):
+                    cell.number_format="#,##0"
+                elif col in (start_col+5,start_col+6) and isinstance(value,(int,float)):
+                    cell.number_format="0.0000"
+            if col in (8,): cell.number_format="#,##0"
+        ws.row_dimensions[idx].height=82
+    ws.freeze_panes="A3"
+
+    # 추천 당시 값과 개찰 후 실제값을 한 행에서 연결하는 운영 기록지.
+    # 추천식 변경이 아니라 향후 관측 실제 낙찰률 검증에 필요한 입력 구조를 제공한다.
+    audit_ws=wb.create_sheet("사후낙찰검증")
+    audit_ws.sheet_view.showGridLines=False
+    audit_headers=[
+        "공고번호","공고명","발주기관","입찰범위","참여업체수",
+        "업체1추천(%)","업체2추천(%)","업체3추천(%)","당사업체",
+        "적용추천순번","적용추천값(%)","실제투찰사정률(%)","예가/기초(0%)(%)",
+        "1순위사정율(0%)(%)","낙찰하한율(%)","무효/실격여부","최종결과",
+        "추천기준 가상판정","실제투찰 가상판정","메모","모델버전",
+    ]
+    audit_widths=[20,44,28,18,12,15,15,15,18,14,16,19,18,20,16,16,16,20,20,34,13]
+    audit_ws.merge_cells(start_row=1,start_column=1,end_row=1,end_column=len(audit_headers))
+    audit_title=audit_ws.cell(
+        1,1,
+        "사후 낙찰검증 기록지 — 개찰 후 노란색 입력란을 채우면 엄격 부등식으로 자동 판정",
+    )
+    audit_title.font=Font(name="맑은 고딕",bold=True,size=13,color="FFFFFFFF")
+    audit_title.fill=PatternFill("solid",start_color=navy)
+    audit_title.alignment=Alignment(horizontal="center",vertical="center")
+    audit_ws.row_dimensions[1].height=30
+    for col,(header,width) in enumerate(zip(audit_headers,audit_widths),1):
+        cell=audit_ws.cell(2,col,header)
+        cell.font=Font(name="맑은 고딕",bold=True,color="FFFFFFFF")
+        cell.fill=PatternFill("solid",start_color=navy)
+        cell.alignment=Alignment(horizontal="center",vertical="center",wrap_text=True)
+        cell.border=border
+        audit_ws.column_dimensions[get_column_letter(col)].width=width
+    input_fill=PatternFill("solid",start_color="FFfff2cc")
+    result_fill=PatternFill("solid",start_color="FFe2f0d9")
+    for idx,row in enumerate(results,3):
+        bid=row["bid"]; recs=row.get("recommendations") or []
+        scope_info=row.get("scope_info") or {}
+        rates=[float(recs[pos]["rate"]) if pos<len(recs) else None for pos in range(3)]
+        base_values=[
+            bid.get("bid_no",""),bid.get("name",""),bid.get("org",""),
+            scope_info.get("scope","기존분석"),int(scope_info.get("company_count",3)),
+            rates[0],rates[1],rates[2],"","","","","","","","","","","","",MODEL_VERSION,
+        ]
+        for col,value in enumerate(base_values,1):
+            cell=audit_ws.cell(idx,col,value)
+            cell.font=Font(name="맑은 고딕",size=9)
+            cell.alignment=Alignment(vertical="center",wrap_text=True)
+            cell.border=border
+            if col in (6,7,8,11,12,13,14,15) and isinstance(value,(int,float)):
+                cell.number_format="+0.0000;-0.0000"
+            if 9<=col<=17 or col==20:
+                cell.fill=input_fill
+            if col in (18,19):
+                cell.fill=result_fill
+        # 적용 추천순번은 사용자가 선택하고, 적용 추천값은 해당 추천열을 자동 참조한다.
+        audit_ws.cell(idx,11,f'=IFERROR(CHOOSE(J{idx},F{idx},G{idx},H{idx}),"")')
+        audit_ws.cell(
+            idx,18,
+            f'=IF(COUNT(K{idx},M{idx},N{idx})<3,"판정불가",'
+            f'IF(AND(M{idx}<K{idx},K{idx}<N{idx}),"가상낙찰","미낙찰"))',
+        )
+        audit_ws.cell(
+            idx,19,
+            f'=IF(COUNT(L{idx},M{idx},N{idx})<3,"판정불가",'
+            f'IF(AND(M{idx}<L{idx},L{idx}<N{idx}),"가상낙찰","미낙찰"))',
+        )
+        audit_ws.row_dimensions[idx].height=48
+    if results:
+        slot_validation=DataValidation(type="list",formula1='"1,2,3"',allow_blank=True)
+        yes_no_validation=DataValidation(type="list",formula1='"정상,무효,실격"',allow_blank=True)
+        outcome_validation=DataValidation(type="list",formula1='"낙찰,미낙찰,판정대기"',allow_blank=True)
+        audit_ws.add_data_validation(slot_validation)
+        audit_ws.add_data_validation(yes_no_validation)
+        audit_ws.add_data_validation(outcome_validation)
+        slot_validation.add(f"J3:J{len(results)+2}")
+        yes_no_validation.add(f"P3:P{len(results)+2}")
+        outcome_validation.add(f"Q3:Q{len(results)+2}")
+        audit_ws.auto_filter.ref=f"A2:U{len(results)+2}"
+        audit_ws.conditional_formatting.add(
+            f"N3:N{len(results)+2}",
+            FormulaRule(formula=['AND(COUNT(M3,N3)=2,N3<M3)'],fill=PatternFill("solid",start_color="FFFFC000")),
+        )
+    audit_ws.freeze_panes="A3"
+
+    basis_ws=wb.create_sheet("검증기준")
+    basis_ws.sheet_view.showGridLines=False
+    basis_rows=[
+        ("항목","검증값 또는 기준"),
+        ("검증 기준일",audit_summary.get("as_of")),
+        ("판정식",audit_summary["rule"]),
+        ("최근 1년 판정가능 표본",audit_summary.get("recent_1y_evaluable")),
+        ("최근 1년 가상 낙찰건수",audit_summary.get("recent_1y_virtual_wins")),
+        ("최근 1년 보유업체 전체 가상 낙찰률",audit_summary.get("recent_1y_virtual_win_rate")),
+        ("최근 1년 중심·단일 가상 낙찰률",audit_summary.get("recent_1y_center_or_single_rate","별도 미산정")),
+        ("최근 1년 1개사 참여 가상 낙찰률",audit_summary.get("recent_1y_single_company_rate","별도 미산정")),
+        ("최근 1년 3개사 참여 가상 낙찰률",audit_summary.get("recent_1y_three_company_rate","별도 미산정")),
+        ("추천식 반영 결정",audit_summary["decision"]),
+        ("검증 모델버전",audit_summary.get("version","미확인")+(" (이전 버전 검증)" if audit_summary.get("previous_version") else "")),
+        ("검증기간·분모","최근 1년 / 참여가능 공고 중 결과값 판정가능 공고. 양수구간이 없는 공고도 실패로 포함합니다." if not audit_summary.get("previous_version") else "이전 v2.15.6 검증 기준이며 현재 모델 성능으로 해석하지 않습니다."),
+        ("동일·역전 구간 판정","결과가 숫자이면 1순위 사정율 ≤ 예가/기초인 경우도 미낙찰로 계산합니다. 역전 구간은 사후낙찰검증의 1순위 사정율 셀을 주황색으로 표시하여 원본 확인 대상으로 구분합니다."),
+        ("해석 주의","가상 낙찰률은 실제 당사 참여기록이 아닌 과거 공고별 반사실적 검증값입니다."),
+        ("입력 안내","사후낙찰검증 시트의 노란색 셀에 개찰 결과와 당사 실제 투찰정보를 입력합니다."),
+    ]
+    for row_idx,(label,value) in enumerate(basis_rows,1):
+        basis_ws.cell(row_idx,1,label)
+        basis_ws.cell(row_idx,2,value)
+        for col in (1,2):
+            cell=basis_ws.cell(row_idx,col)
+            cell.font=Font(name="맑은 고딕",bold=(row_idx==1 or col==1),color="FFFFFFFF" if row_idx==1 else "FF111827")
+            cell.fill=PatternFill("solid",start_color=navy if row_idx==1 else ("FFeef2ff" if col==1 else "FFFFFFFF"))
+            cell.alignment=Alignment(vertical="center",wrap_text=True)
+            cell.border=border
+        if row_idx in (6,7,8,9):
+            basis_ws.cell(row_idx,2).number_format="0.00%"
+    basis_ws.column_dimensions["A"].width=38
+    basis_ws.column_dimensions["B"].width=92
+    basis_ws.freeze_panes="A2"
+    buf=io.BytesIO(); wb.save(buf); buf.seek(0)
+    import ledger_metadata
+    return ledger_metadata.add_excel_metadata(buf,ledger_metadata.manifest())
+
+def format_lower_limit_rate(value):
+    rate=parse_lower_limit_rate(value)
+    if rate is None:
+        return "미확인"
+    return f"{rate:.6f}".rstrip("0").rstrip(".")+"%"
+
+
+def make_strategy_summary_excel(results):
+    """공고명·낙찰하한율·업체1~3 최종 추천만 포함한 요약 Excel."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    wb=Workbook(); ws=wb.active; ws.title="투찰전략"
+    ws.sheet_view.showGridLines=False
+    navy="FF1a2744"; light="FFf8fafc"
+    thin=Side(style="thin",color="FFd1d5db")
+    border=Border(left=thin,right=thin,top=thin,bottom=thin)
+    headers=["공고명","낙찰하한율","업체1추천","업체2추천","업체3추천"]
+    widths=[60,15,15,15,15]
+
+    ws.merge_cells("A1:E1")
+    title=ws["A1"]
+    title.value=f"투찰전략 분석 — {MODEL_VERSION} / {datetime.now().strftime('%Y.%m.%d')}"
+    title.font=Font(name="맑은 고딕",bold=True,size=14,color="FFFFFFFF")
+    title.fill=PatternFill("solid",start_color=navy)
+    title.alignment=Alignment(horizontal="center",vertical="center")
+    ws.row_dimensions[1].height=30
+
+    for col,(header,width) in enumerate(zip(headers,widths),1):
+        cell=ws.cell(2,col,header)
+        cell.font=Font(name="맑은 고딕",bold=True,color="FFFFFFFF")
+        cell.fill=PatternFill("solid",start_color=navy)
+        cell.alignment=Alignment(horizontal="center",vertical="center",wrap_text=True)
+        cell.border=border
+        ws.column_dimensions[get_column_letter(col)].width=width
+    ws.row_dimensions[2].height=26
+
+    for row_idx,row in enumerate(results,3):
+        bid=row.get("bid") or {}
+        recs=row.get("recommendations") or []
+        scope_info=row.get("scope_info") or {}
+        company_count=int(scope_info.get("company_count",len(recs) or 3))
+        values=[str(bid.get("name") or ""),format_lower_limit_rate(bid.get("lower_limit_rate"))]
+        for pos in range(3):
+            if pos < len(recs):
+                values.append(f"{float(recs[pos]['rate']):+.4f}%")
+            elif pos >= company_count:
+                values.append("참여대상 없음")
+            else:
+                values.append("없음")
+        for col,value in enumerate(values,1):
+            cell=ws.cell(row_idx,col,value)
+            cell.font=Font(name="맑은 고딕",size=10)
+            cell.fill=PatternFill("solid",start_color=light if row_idx%2==0 else "FFFFFFFF")
+            cell.alignment=Alignment(
+                horizontal="left" if col==1 else "center",
+                vertical="center",
+                wrap_text=(col==1),
+            )
+            cell.border=border
+        ws.row_dimensions[row_idx].height=32
+
+    last_row=max(2,len(results)+2)
+    ws.auto_filter.ref=f"A2:E{last_row}"
+    ws.freeze_panes="A3"
+    buf=io.BytesIO(); wb.save(buf); buf.seek(0)
+    import ledger_metadata
+    return ledger_metadata.add_excel_metadata(buf,ledger_metadata.manifest())
+
+
+# ════════════════════════════════════════════════════════════════
+#  메인 UI
+# ════════════════════════════════════════════════════════════════
+st.markdown("""
+<div class="main-header">
+<h2>📊 투찰전략 분석 시스템 v2.15.11</h2>
+<p style="margin:0;opacity:0.8">입찰 참여조건에 따른 최대 3개 업체 추천 사정률·추천기준금액과 산정 근거</p>
+</div>""", unsafe_allow_html=True)
+
+with st.sidebar:
+    st.header("⚙️ 시스템 설정")
+    mode=st.radio("모드 선택",["📊 투찰전략 분석","🔧 배포자 관리"])
+    strategy_display=st.selectbox("전략 선택",list(bid_strategies.MODES))
+    strategy_mode=bid_strategies.MODES[strategy_display]
+    st.caption("관측 1위 기반 시험운영입니다. S1은 기존 계산 기준을 유지합니다.")
+    st.caption("원장 전환 지원: collection-20261001 · 추천모형 v2.15.11 유지")
+    st.divider()
+    df_hist=load_history(); pattern_stats=load_pattern_stats()
+    quality_info=load_history_quality(df_hist) if df_hist is not None else {}
+    import ledger_metadata
+    active_manifest=ledger_metadata.manifest(df_hist)
+    if active_manifest:
+        st.caption(ledger_metadata.description(active_manifest))
+        st.warning(active_manifest['unresolved'])
+        st.caption(active_manifest['region_basis'])
+        if active_manifest.get('classification_review_events'):
+            st.warning(f"중복 출처의 업종 분류 확인대상 {active_manifest['classification_review_events']}키(학습 후보 {active_manifest['classification_review_learning_rows']}건): 용역 원문을 대표값으로 사용하며 실제 업종은 원문확인이 필요합니다.")
+    if df_hist is not None:
+        df_c_s=df_hist[df_hist["예가/기초(0%)"].notna()&(df_hist["예가/기초(0%)"].abs()<10)]
+        n_c=len(df_c_s); n_o=df_c_s["발주기관"].nunique()
+        st.success(f"✅ 낙찰이력 {n_c:,}건\n{n_o}개 발주처")
+        with st.expander("🔎 낙찰이력 데이터 품질"):
+            st.caption(history_quality_warning(quality_info))
+            st.caption(history_period_text(quality_info))
+            if active_manifest:
+                states=active_manifest['numeric_status'];warnings=active_manifest['warnings']
+                st.caption(f"원천행 품질: 예가·1순위 숫자 {states['both_numeric']:,}행 / 예가만 숫자 {states['target_only_numeric']:,}행 / 예가 숫자 없음 {states['target_not_numeric']:,}행")
+                st.caption(f"품질경고(중복 가능): 공고명 누락 {warnings['missing_name']} / 기관 누락 {warnings['missing_org']} / 개찰일 미확인 {warnings['missing_date']} / 미래 개찰 {warnings['future_opening']} / 비정상 예가 {warnings['abnormal_target']} / 비정상 1순위 {warnings['abnormal_winner']}")
+            if int(quality_info.get("electric_region_missing_rows",0))>0:
+                st.warning(
+                    "전기공사 지역 누락 행은 동일지역 요소를 제외하고 "
+                    "사용 가능한 나머지 가중치를 재정규화합니다."
+                )
+    else:
+        st.warning("⚠️ 낙찰이력 없음"); df_c_s=None; n_c=0; n_o=0
+    if pattern_stats:
+        st.success(f"✅ 패턴통계 {len(pattern_stats)}개 발주처")
+    with st.expander("📈 최근 엄격 백테스트 검증"):
+        if active_manifest:
+            st.caption("아래는 기존 원장·기존 기준일의 확정 검증기록입니다. 신규 원장 전후 회귀결과는 별도 전환 검증보고서를 확인하세요.")
+        st.caption(
+            f"{'이전 버전 검증 · ' if AUDIT_SUMMARY.get('previous_version') else ''}"
+            f"{AUDIT_SUMMARY.get('version',MODEL_VERSION)} / 기준일 {AUDIT_SUMMARY.get('as_of','미확인')} · 같은 개찰일 결과를 학습에서 제외한 rolling 검증"
+        )
+        if AUDIT_SUMMARY.get("recent_1y_virtual_win_rate") is not None:
+            st.metric(
+                "최근 1년 보유업체 전체 가상 낙찰",
+                f"{AUDIT_SUMMARY['recent_1y_virtual_win_rate']:.2%}",
+                f"{AUDIT_SUMMARY.get('recent_1y_virtual_wins',0):,}/{AUDIT_SUMMARY.get('recent_1y_evaluable',0):,}건",
+            )
+        if AUDIT_SUMMARY.get("recent_1y_center_or_single_rate") is not None:
+            st.metric("최근 1년 중심·단일 1개 값",f"{AUDIT_SUMMARY['recent_1y_center_or_single_rate']:.2%}")
+        st.caption(AUDIT_SUMMARY["rule"])
+        st.warning(
+            "가상 낙찰률은 과거 공고별 반사실적 검증값이며 실제 당사 낙찰률이 아닙니다. "
+            + AUDIT_SUMMARY["decision"]
+        )
+    st.divider()
+    st.caption(f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+
+# ══ 배포자 관리 ══════════════════════════════════════════════════
+if mode=="🔧 배포자 관리":
+    st.header("🔧 배포자 관리")
+    pwd=st.text_input("관리자 비밀번호",type="password")
+    ADMIN_PWD=st.secrets.get("ADMIN_PWD","admin1234")
+    if pwd!=ADMIN_PWD: st.info("비밀번호를 입력하세요."); st.stop()
+    st.success("✅ 관리자 인증")
+    uploaded=st.file_uploader("낙찰이력 xlsx 업로드",type=["xlsx","xls"])
+    if uploaded:
+        with st.spinner("처리 중..."):
+            try:
+                content=uploaded.read()
+                df_new=ledger_metadata.read_upload(content)
+                required=["개찰일","발주기관","공고명","기초금액","예가/기초(0%)"]
+                missing=[c for c in required if c not in df_new.columns]
+                if missing: st.error(f"필수 컬럼 없음: {missing}")
+                else:
+                    quality_info=save_history(df_new)
+                    df_clean=prepare_history_frame(df_new)
+                    target=pd.to_numeric(df_clean["예가/기초(0%)"],errors="coerce")
+                    df_v=df_clean[target.notna()&(target.abs()<10)]
+                    st.success("✅ 업로드 완료!")
+                    c1,c2,c3,c4=st.columns(4)
+                    c1.metric("총 건수",f"{len(df_v):,}건")
+                    c2.metric("발주처 수",f"{df_v['발주기관'].nunique()}개")
+                    c3.metric("평균 사정율",f"{df_v['예가/기초(0%)'].mean():+.4f}%")
+                    c4.metric("완전 동일 중복 제거",f"{quality_info.get('exact_duplicates',0):,}건")
+                    st.info(history_quality_warning(quality_info))
+                    st.caption(history_period_text(quality_info))
+            except Exception as e: st.error(f"오류: {e}")
+
+# ══ 투찰전략 분석 ════════════════════════════════════════════════
+else:
+    df_hist=load_history()
+    df_c = df_hist[df_hist["예가/기초(0%)"].notna()&(df_hist["예가/기초(0%)"].abs()<10)].copy() if df_hist is not None else None
+    quality_info=load_history_quality(df_hist) if df_hist is not None else {}
+    pattern_stats=load_pattern_stats()
+
+    st.header("📊 투찰전략 분석")
+    col_up,col_info=st.columns([2,1])
+    with col_up:
+        xls_file=st.file_uploader("입찰서류함 xls 파일 업로드",type=["xls","xlsx"])
+    with col_info:
+        nc=n_c if 'n_c' in dir() else (len(df_c) if df_c is not None else 0)
+        no=n_o if 'n_o' in dir() else (df_c['발주기관'].nunique() if df_c is not None else 0)
+        st.markdown(f"""
+        <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:12px;font-size:0.9em">
+        <b>📌 적용 전략: {strategy_display}</b><br>
+        <b>자동 선택:</b> 전기공사 S4 · 건설사업관리 S3 · 기존사업 S3<br>
+        <b>근거:</b> 2026.09.27 연구의 분야별 관측 가격구간 통과율 1위<br>
+        <b>주의:</b> 실제 낙찰확률·미래 우위가 아닙니다. 기존사업의 통계적 우위는 미확정입니다.<br>
+        <b>소표본:</b> 동일범위 2년 → 최대4년 → S3 대체 → 참고 중심값 → 산정보류<br>
+        <b>정렬:</b> 개찰일 → 공고번호 → 번호 안정 정렬(동일일 재현성 고정)<br>
+        <b>참여:</b> 부산울산 지역제한 감리 1억원 이상 3개사·미만 2개사 · 경북·대구 지역제한 감리 1개사 · 한전 전국 감리 3개사 · 한전 VLF진단 1억원 이상 3개사·미만 2개사 · 기타진단 3개사 · 전기공사 1개사<br>
+        <b>모델군:</b> 일반 건설사업관리·일반진단·설계·일반감리·한전감리·공동주택 및 주거시설 감리<br>
+        <b>대체분석:</b> 발주기관·모델군별 보류검증을 통과한 경우 해당 추천방법에 적용<br>
+        <b>데이터:</b> {nc:,}건 | {no}개 발주처
+        </div>""",unsafe_allow_html=True)
+    if quality_info:
+        st.caption("데이터 품질: "+history_quality_warning(quality_info))
+
+    if not xls_file:
+        st.info("👆 입찰서류함 xls 파일을 업로드하면 자동 분석합니다."); st.stop()
+
+    with st.spinner("파일 읽는 중..."):
+        try:
+            raw_bytes = xls_file.getvalue()
+            # 낙찰이력 파일 오업로드 감지 (5MB 이상 + xlsx)
+            if len(raw_bytes) > 3_000_000 and xls_file.name.lower().endswith(".xlsx"):
+                st.error(
+                    "⚠️ **잘못된 파일입니다.**\n\n"
+                    "- 지금 업로드한 파일: **낙찰이력 데이터** (배포자 관리 전용)\n"
+                    "- 여기서 필요한 파일: **나라장터 입찰서류함 xls**\n\n"
+                    "👉 낙찰이력 업로드는 **사이드바 → 배포자 관리** 에서 진행하세요."
+                )
+                st.stop()
+            bids = parse_xls(raw_bytes, xls_file.name)
+            original_bid_count=len(bids)
+            bids,revision_exclusions=bid_strategies.latest_notices(bids)
+            if not bids:
+                st.error(
+                    "입찰 건을 읽을 수 없습니다.\n\n"
+                    "나라장터에서 다운받은 **입찰서류함 xls** 파일을 업로드해 주세요.\n"
+                    "낙찰이력 파일(낙찰데이터.xlsx)은 **배포자 관리** 탭에서 업로드하세요."
+                )
+                st.stop()
+        except Exception as e:
+            st.error(
+                f"파일 읽기 오류: {e}\n\n"
+                "나라장터 입찰서류함 xls 파일인지 확인해 주세요."
+            )
+            st.stop()
+
+    st.success(f"✅ 원본 {original_bid_count}행 · 구차수/중복 {len(revision_exclusions)}행 제외 · 최종 {len(bids)}건")
+    if revision_exclusions:
+        with st.expander("정정공고 제외내역"):
+            st.dataframe(pd.DataFrame(revision_exclusions),hide_index=True,use_container_width=True)
+    st.warning("관측 1위 기반 시험운영입니다. 추천기준금액은 최종 투찰금액이 아니며, 참가자격·A값·최저가격 조건은 공고 원문으로 확인하세요.")
+    results=[]
+    df_model=enrich_history(df_c) if df_c is not None else None
+    with st.spinner(f"분석 중... ({len(bids)}건)"):
+        try:
+            batch_predictions=predict_final_batch(bids,df_c,strategy_mode=strategy_mode)
+        except ValueError as exc:
+            st.error(f"추천 계산을 진행할 수 없습니다: {exc}")
+            st.stop()
+        for b,batch_result in zip(bids,batch_predictions):
+            scope_info=classify_bid_scope(b)
+            amt_lbl,amt_adj,amt_note=get_amt_info(b["base_억"])
+            results.append({"bid":b,"a1":None,"a2":None,"a3":None,
+                            "improved":None,
+                            "scope_info":scope_info,
+                            "amt_lbl":amt_lbl,"amt_adj":amt_adj,"amt_note":amt_note,
+                            **batch_result})
+
+    # ── 요약 테이블: 최종 추천값과 근거만 표시 ───────────────
+    st.subheader(f"📋 최대 3개 업체 추천 사정률 — {datetime.now().strftime('%Y.%m.%d')} ({len(bids)}건)")
+    rows=[]
+    for row in results:
+        b=row["bid"]; recs=row.get("recommendations") or []
+        scope_info=row.get("scope_info") or {}
+        company_count=int(scope_info.get("company_count",3))
+        is_scoped=bool(scope_info.get("applicable"))
+        vals=[f"{r['rate']:+.4f}%" for r in recs]
+        bases=[r["basis"] for r in recs]
+        prediction=row.get("prediction") or {}
+        notes=[f"전략: {prediction.get('selected_strategy','미확인')} / 상태: {prediction.get('status','미확인')}"]
+        notes.extend(prediction.get("fallback_notes",[]))
+        if row.get("error"):
+            notes.append(row["error"])
+        if scope_info:
+            notes.append(
+                f"입찰구분: {scope_info['scope']} / 참여 {company_count}개사 / "
+                f"{scope_info['basis']}"
+            )
+        for i in range(3):
+            if i<len(bases):
+                notes.append(f"업체{i+1}: {bases[i]}")
+            elif i>=company_count:
+                notes.append(f"업체{i+1}: 참여대상 없음")
+            else:
+                notes.append(f"업체{i+1}: 데이터 부족")
+        display_vals=[
+            vals[i] if i<len(vals)
+            else "참여대상 없음" if i>=company_count
+            else "없음"
+            for i in range(3)
+        ]
+        rows.append({
+            "중심모델군":model_family_info(b)[1],
+            "공고명":b["name"][:40]+"…" if len(b["name"])>40 else b["name"],
+            "낙찰하한율":format_lower_limit_rate(b.get("lower_limit_rate")),
+            "업체1추천":display_vals[0],
+            "업체2추천":display_vals[1],
+            "업체3추천":display_vals[2],
+            "비고":"\n".join(notes)
+        })
+    summary_columns=[
+        "중심모델군",
+        "공고명",
+        "낙찰하한율",
+        "업체1추천",
+        "업체2추천",
+        "업체3추천",
+        "비고",
+    ]
+    summary_df=pd.DataFrame(rows, columns=summary_columns)
+    st.dataframe(
+        summary_df,
+        use_container_width=True,
+        hide_index=True,
+        height=min(760, 38 + 36 * max(len(summary_df), 1)),
+    )
+    st.divider()
+
+    # ── 건별 상세 ────────────────────────────────────────────
+    st.subheader("📌 건별 상세 + 사정율 흐름 차트")
+    for row in results:
+        b=row["bid"]; recs=row.get("recommendations") or []
+        scope_info=row.get("scope_info") or {}
+        scope_label=(
+            f"  |  {scope_info['scope']} {scope_info['company_count']}개사"
+            if scope_info else ""
+        )
+        label=(f"No.{b['no']}  {b['name'][:48]}  |  "
+               f"{b['org'].replace('한국전력공사 ','한전 ')}  |  "
+               f"{b['base_억']:.4f}억  |  {b['deadline']}{scope_label}")
+        with st.expander(label):
+            st.caption("중심모델군: "+model_family_info(b)[1]+" / 세부업종: "+SERVICE_LABELS.get(classify_service(b.get("name",""),b.get("industry","")),"기타"))
+            if scope_info:
+                st.info(
+                    f"{scope_info['scope']} · 참여 {scope_info['company_count']}개사 · "
+                    f"{scope_info['basis']}"
+                )
+            if scope_info.get("scope_assumed"):
+                st.warning("입찰범위·참여업체 수에 운영 가정이 포함되어 있습니다. 공고의 지역제한 및 당사 참가자격을 확인한 후 적용하세요. "+scope_info.get("basis",""))
+            if is_electric_construction_bid(b) and simple_region(b.get("region",""))=="지역미상":
+                st.warning("지역 정보가 없어 동일지역 요소를 제외하고 나머지 가중치를 재정규화했습니다.")
+            if recs:
+                cols=st.columns(len(recs))
+                styles=["val-a","val-b","val-c"]
+                for col,rec,style in zip(cols,recs,styles):
+                    with col:
+                        amount_value=recommendation_reference_amount(b.get("base",0),rec["rate"])
+                        amount=(
+                            f"<br><small>추천기준금액</small><br>{amount_value:,}원"
+                            if amount_value is not None else ""
+                        )
+                        st.markdown(
+                            f'<div class="{style}">🏢 {rec["company"]}<br>{rec["rate"]:+.4f}%{amount}</div>',
+                            unsafe_allow_html=True
+                        )
+                        st.caption(
+                            f"적용 모델: {rec.get('model_label',rec.get('role','-'))} · "
+                            f"기초 이력 {int(rec.get('basis_n',0) or 0):,}건 · 산정 근거: {rec['basis']}"
+                        )
+            else:
+                st.warning(row.get("error") or "추천값을 계산할 낙찰이력이 부족합니다.")
+
+            # ── 사정율 흐름 차트: 발주처 전체 vs 해당분야 ───────
+            st.markdown("---")
+            st.markdown("**사정율 흐름 차트**")
+            with st.spinner("단순 비교차트 생성 중..."):
+                df_bid=history_for_bid(b,df_model,scope_info)
+                chart_buf,chart_data=make_simple_flow_chart(df_bid,b,max_n=20)
+            if chart_buf:
+                m1,m2=st.columns(2)
+                with m1:
+                    vals=chart_data["org_vals"]
+                    st.metric(
+                        "해당 발주처 전체",
+                        f"{np.mean(vals):+.4f}%" if vals else "-",
+                        f"표본 {chart_data['org_n']}건"
+                    )
+                with m2:
+                    vals=chart_data["svc_vals"]
+                    st.metric(
+                        f"{chart_data['service_label']} 분야",
+                        f"{np.mean(vals):+.4f}%" if vals else "-",
+                        f"{chart_data['svc_label']} {chart_data['svc_n']}건"
+                    )
+                st.image(chart_buf,use_container_width=True)
+            else:
+                st.caption("⚠️ 차트에 표시할 이력 데이터가 부족합니다.")
+
+    st.divider()
+    st.subheader("💾 전략표 다운로드")
+    excel_buf=bid_strategies.add_review_sheets(make_excel_simple(results,quality_info),results,revision_exclusions)
+    today_str=datetime.now().strftime("%Y%m%d")
+    st.download_button("📥 업체 추천표 다운로드",
+        data=excel_buf,
+        file_name=f"투찰전략_{today_str}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",use_container_width=True)
+    summary_excel_buf=bid_strategies.add_review_sheets(make_strategy_summary_excel(results),results,revision_exclusions)
+    st.download_button("📥 투찰전략 요약 다운로드",
+        data=summary_excel_buf,
+        file_name=f"투찰전략_요약_{today_str}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True)
+
+    st.download_button("📥 사전추천 계산기록 JSON 저장",
+        data=bid_strategies.snapshot(results,revision_exclusions),
+        file_name=f"투찰전략_계산기록_{today_str}.json",mime="application/json",use_container_width=True)
