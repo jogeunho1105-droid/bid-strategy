@@ -41,7 +41,7 @@
     "bid_strategies.py": "e0f36768bcee3d776f721d4fe42a5bee8fa5e10494ea6ea0fa91246fc41c0a62",
     "model_policy.json": "bc1b5f964c638413f177498d417018942872f97e6f0503023b4ffa9014ba56e5"
   },
-  "production_secrets_and_reboot": "user confirmed app-specific key configuration; deployment/reboot verification pending",
+  "production_secrets_and_reboot": "verified",
   "full_rolling": {
     "valid_history": 91259,
     "S1_S5_and_auto_all_periods_families_same_counts": true,
@@ -51,5 +51,40 @@
     "burn_in": 150,
     "before_seconds": 1863,
     "after_seconds": 1954
-  }
+  },
+  "production": {
+    "url": "https://bid-strategy-axthwj3dpryewsmzj35fvt.streamlit.app/",
+    "code_commit": "063cd971355c6fc29cf287fe9bb261cfd9c7f594",
+    "initial_private_restore_log": "PRIVATE_LEDGER_RESTORE_OK operational_rows=112572",
+    "real_streamlit_reboot": true,
+    "fresh_server_start_utc": "2026-11-09T13:49:33Z",
+    "fresh_repo_clone_utc": "2026-11-09T13:49:35Z",
+    "post_reboot_restore_log": "PRIVATE_LEDGER_RESTORE_OK operational_rows=112572",
+    "manual_ledger_uploads": 0,
+    "operational_rows": 112572,
+    "training_rows": 91259,
+    "source_rows": 121330,
+    "issuers": 3356,
+    "data_version": "collection-20261109-supervision-8482",
+    "last_learning_date": "2026-11-09",
+    "existing_admin_auth_passed": true,
+    "sample_notices": 4,
+    "recommendation_counts": [
+      1,
+      3,
+      3,
+      2
+    ],
+    "download_verification": [
+      {
+        "download": "production-persistence-recommendations.xlsx",
+        "identical_cells": true
+      },
+      {
+        "download": "production-persistence-summary.xlsx",
+        "identical_cells": true
+      }
+    ]
+  },
+  "frozen_originals_still_unchanged": true
 }
