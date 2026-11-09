@@ -13,7 +13,7 @@ from test_v2_15_4 import load_app_namespace
 import ledger_metadata
 import bid_strategies
 
-def run(directory):
+def run(directory,ledger_xlsx=None,deadline=None):
     directory = Path(directory)
     wb = Workbook(); ws = wb.active
     ws.append(['Synthetic smoke fixture; no real submission'])
@@ -25,12 +25,12 @@ def run(directory):
         ('전력시설물 감리용역', '감리', '한국전력공사 부산울산본부', 80_000_000, '부산'),
     ]
     for i, (name, industry, org, base, region) in enumerate(cases, 1):
-        ws.append([i, name, f'SMOKE20261014-{i:03d}-00', base, '26.09.30 (10:00)', org, industry, region, 88.])
+        ws.append([i, name, f'SMOKE20261109-{i:03d}-00' if deadline else f'SMOKE20261014-{i:03d}-00', base, deadline or '26.09.30 (10:00)', org, industry, region, 88.])
     sample = directory / 'sample_bid_folder.xlsx'; wb.save(sample)
     app = load_app_namespace()
     bids = app['parse_xls'](sample.read_bytes(), sample.name)
     assert len(bids) == 4
-    history = pd.read_pickle(directory / 'operational.pkl')
+    history = ledger_metadata.read_upload(Path(ledger_xlsx).read_bytes()) if ledger_xlsx else pd.read_pickle(directory / 'operational.pkl')
     metadata = json.loads((directory / 'manifest.json').read_text(encoding='utf-8'))
     history.attrs[ledger_metadata.ATTR] = metadata
     prepared = app['prepare_history_frame'](history)
@@ -54,5 +54,5 @@ def run(directory):
     print(json.dumps(result,ensure_ascii=True,default=str))
 
 if __name__ == '__main__':
-    p=argparse.ArgumentParser();p.add_argument('--source-dir',required=True)
-    run(p.parse_args().source_dir)
+    p=argparse.ArgumentParser();p.add_argument('--source-dir',required=True);p.add_argument('--ledger-xlsx');p.add_argument('--deadline');a=p.parse_args()
+    run(a.source_dir,a.ledger_xlsx,a.deadline)

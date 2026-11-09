@@ -53,9 +53,13 @@ def manifest(frame=None, quality_path="data/history_quality.json"):
 
 def description(m):
     if not m:return "수집 원장 버전 미확인 · 관리자 업로드 출처를 확인하세요."
-    return (f"{m['source']} | {m['version']} | 원천 {m['source_rows']:,}행 · "
+    result=(f"{m['source']} | {m['version']} | 원천 {m['source_rows']:,}행 · "
             f"운영 {m['operational_rows']:,}행 · 학습 {m['training_rows']:,}행 | "
             f"학습 최종일 {m['data_end_date']} | 완료 {m['completed_tasks']}/{m['total_tasks']}")
+    if m.get('supervision_update'):
+        u=m['supervision_update']
+        result+=f" | 감리 추가수집 {u['source_events']:,}건 · 신규 {u['added_events']:,}건 · {u['collection_batches_completed']}/{u['collection_batches_total']}구간 완료"
+    return result
 
 def add_excel_metadata(buffer, m):
     if not m:return buffer
@@ -72,6 +76,11 @@ def add_excel_metadata(buffer, m):
              ("중복관리",f"용역/전기공사 {m['dual_profile_events']}키는 사건당 1회 학습; 원천 출처 별도 보존")]
     if m.get('classification_review_events'):
         entries.append(('업종·분류 확인대상',f"두 원문 업종의 기존 분류결과가 다른 {m['classification_review_events']}키(학습 후보 {m['classification_review_learning_rows']}건); 용역 출처 대표값 정책 적용, 실제 업종 원문확인 필요"))
+    if m.get('supervision_update'):
+        u=m['supervision_update']
+        entries.extend([('감리 추가수집·중복관리',f"수집 {u['source_events']:,}건 / 기존 중복 {u['overlap_events']:,}건 1회 반영 / 신규 {u['added_events']:,}건 / 값 갱신 {u['updated_value_events']:,}건; 이전 원장·출처 보존"),
+                        ('감리 참여업체 원문',f"{u['participant_rows_preserved']:,}행 별도 보존; 학습 사건수에 이중 합산하지 않음"),
+                        ('감리 원문 공개 예외',f"{u['source_exception_events']}건; 원문 상태와 경고 보존")])
     for a,b in entries:sheet.append([a,b])
     sheet.column_dimensions['A'].width=30;sheet.column_dimensions['B'].width=100
     for index,row in enumerate(sheet,1):

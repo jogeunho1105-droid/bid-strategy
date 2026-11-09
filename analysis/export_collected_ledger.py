@@ -8,10 +8,11 @@ from openpyxl.cell import WriteOnlyCell
 from openpyxl.utils import get_column_letter
 
 import argparse
-parser=argparse.ArgumentParser();parser.add_argument('--source-dir',required=True)
-p=Path(parser.parse_args().source_dir);m=json.loads((p/'manifest.json').read_text(encoding='utf-8'))
+parser=argparse.ArgumentParser();parser.add_argument('--source-dir',required=True);parser.add_argument('--output-name',default='신규_운영_낙찰데이터_20261001.xlsx')
+args=parser.parse_args();p=Path(args.source_dir);m=json.loads((p/'manifest.json').read_text(encoding='utf-8'))
 d=pd.read_pickle(p/'operational.pkl');lineage=pd.read_csv(p/'source_excel_lineage.csv.gz',keep_default_na=False)
-d=d.merge(lineage[['task','source_csv_row','source_excel','source_excel_row']],left_on=['source_task','source_csv_row'],right_on=['task','source_csv_row'],how='left',validate='one_to_one').drop(columns=['task'])
+if 'source_excel' not in d:
+    d=d.merge(lineage[['task','source_csv_row','source_excel','source_excel_row']],left_on=['source_task','source_csv_row'],right_on=['task','source_csv_row'],how='left',validate='one_to_one').drop(columns=['task'])
 review=pd.read_csv(p/'classification_review.csv',dtype=str,keep_default_na=False)
 needs_review=d.event_id.isin(set(review.event_id))
 d.loc[needs_review,'quality_warnings']=d.loc[needs_review,'quality_warnings'].map(lambda v:(';'.join([v,'dual_profile_classification_review'])).strip(';'))
@@ -47,11 +48,11 @@ classes=wb.create_sheet('분류확인');classes.freeze_panes='A2'
 for i,col in enumerate(review.columns,1):classes.column_dimensions[get_column_letter(i)].width=65 if col=='공고명' else 100 if col.endswith('csv') else 35
 classes.append(list(review.columns))
 for row in review.itertuples(index=False,name=None):classes.append(row)
-file=p/'신규_운영_낙찰데이터_20261001.xlsx';wb.save(file)
+file=p/args.output_name;wb.save(file)
 w=load_workbook(file,read_only=True,data_only=True)
 assert w.sheetnames==['통합낙찰이력','데이터출처','원천행출처','분류확인']
-total=sum(1 for _ in w['통합낙찰이력'].values)-1;assert total==112127
-assert sum(1 for _ in w['원천행출처'].values)-1==112848
-assert sum(1 for _ in w['분류확인'].values)-1==496
+total=sum(1 for _ in w['통합낙찰이력'].values)-1;assert total==m['operational_rows']
+assert sum(1 for _ in w['원천행출처'].values)-1==m['source_rows']
+assert sum(1 for _ in w['분류확인'].values)-1==m.get('classification_review_events',0)
 w.close();print('exported',file.name,total,file.stat().st_size,flush=True)
 
