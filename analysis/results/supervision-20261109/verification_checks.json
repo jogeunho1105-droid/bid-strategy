@@ -1,0 +1,109 @@
+{
+  "tests": {
+    "run": 139,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "excluded_module": "test_v2_15_6: four historical analysis modules absent from repository",
+    "runtime": "Streamlit 1.40.2 / pandas 2.3.3 / numpy 2.5.4"
+  },
+  "real_ledger_app_test": {
+    "exceptions": 0,
+    "dataframes": 1,
+    "real_training_rows": 91259,
+    "version_visible": true,
+    "sample_notices": 4
+  },
+  "format_comparison": {
+    "counts": [
+      1,
+      3,
+      3,
+      2
+    ],
+    "before_rates": [
+      [
+        0.32
+      ],
+      [
+        -0.7068,
+        -0.0909,
+        0.5384
+      ],
+      [
+        -0.7661,
+        -0.1497,
+        0.3638
+      ],
+      [
+        -0.2601,
+        0.1622
+      ]
+    ],
+    "after_rates": [
+      [
+        0.32
+      ],
+      [
+        -0.7112,
+        -0.0736,
+        0.5582
+      ],
+      [
+        -0.7661,
+        -0.1497,
+        0.3638
+      ],
+      [
+        -0.2601,
+        0.1728
+      ]
+    ],
+    "files": {
+      "make_excel_simple.xlsx": {
+        "sheet_names_same": true,
+        "column_order_same": true,
+        "column_widths_same": true
+      },
+      "make_strategy_summary_excel.xlsx": {
+        "sheet_names_same": true,
+        "column_order_same": true,
+        "column_widths_same": true
+      }
+    }
+  },
+  "old_ledger_and_seven_backups_sha256_unchanged": true,
+  "engine_rules_weights_policy_unchanged": true,
+  "code_commit": "3b3b1800a9d5b066ea95fbd39395198dc2d32147",
+  "production": {
+    "url": "https://bid-strategy-axthwj3dpryewsmzj35fvt.streamlit.app/",
+    "checked_at": "2026-11-09T21:54:00+09:00",
+    "app_version": "v2.15.11",
+    "dataset_version": "collection-20261109-supervision-8482",
+    "operational_rows": 112572,
+    "training_rows": 91259,
+    "issuers": 3356,
+    "last_learning_date": "2026-11-09",
+    "admin_upload_completed": true,
+    "sample_notices": 4,
+    "recommendation_counts": [
+      1,
+      3,
+      3,
+      2
+    ],
+    "table_columns_preserved": 7,
+    "download_workbooks": [
+      {
+        "download": "production_recommendations.xlsx",
+        "identical_cells": true
+      },
+      {
+        "download": "production_summary.xlsx",
+        "identical_cells": true
+      }
+    ],
+    "all_download_cells_match_local": true,
+    "private_data_committed": false
+  }
+}
