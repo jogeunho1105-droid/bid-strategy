@@ -174,6 +174,12 @@ def get_three_pt(org, pred):
 # ── 낙찰이력 로드 ─────────────────────────────────────────────
 @st.cache_data
 def load_history():
+    import ledger_store
+    try:
+        ledger_store.restore_if_needed(HISTORY_FILE, save_history)
+    except ledger_store.StoreError as error:
+        st.error(str(error))
+        st.stop()
     if os.path.exists(HISTORY_FILE):
         frame=pd.read_pickle(HISTORY_FILE)
         return prepare_history_frame(frame)
@@ -261,13 +267,27 @@ def history_quality_summary(df):
 
 @st.cache_data
 def load_history_quality(df=None):
+    import ledger_metadata
+    metadata=ledger_metadata.manifest(df)
     if os.path.exists(HISTORY_QUALITY_FILE):
         try:
             with open(HISTORY_QUALITY_FILE,encoding="utf-8") as f:
-                return json.load(f)
+                saved=json.load(f)
+            previous=saved.get(ledger_metadata.ATTR,{})
+            if not metadata or all(previous.get(k)==metadata.get(k) for k in ('version','operational_data_sha256')):
+                return saved
         except Exception:
             pass
-    return history_quality_summary(df) if df is not None else {}
+    source=df
+    if metadata:
+        operational=os.path.join(DATA_DIR,metadata['version']+'.pkl')
+        if os.path.exists(operational):source=pd.read_pickle(operational)
+    quality=history_quality_summary(source) if source is not None else {}
+    if metadata:
+        quality[ledger_metadata.ATTR]=metadata
+        for k in ('training_rows','data_start_date','data_end_date'):
+            quality['valid_rows' if k=='training_rows' else k]=metadata[k]
+    return quality
 
 def history_quality_warning(quality):
     if not quality:
@@ -295,6 +315,7 @@ def history_period_text(quality):
 def save_history(df):
     os.makedirs(DATA_DIR, exist_ok=True)
     import ledger_metadata
+    import ledger_store
     from pathlib import Path
     import shutil
     metadata=ledger_metadata.manifest(df,quality_path="__no_previous_metadata__")
@@ -306,22 +327,21 @@ def save_history(df):
                 shutil.copy2(old,frozen/Path(old).name)
         # Store all operational quality states separately from the filtered learning view.
         source=Path(DATA_DIR)/(metadata['version']+".pkl")
-        if not source.exists():df.to_pickle(source)
+        if not source.exists():ledger_store.write_atomic(source, df.to_pickle)
         lineage=Path(DATA_DIR)/(metadata['version']+"-lineage.csv.gz")
         if df.attrs.get('collection_lineage_csv_gzip') and not lineage.exists():
-            lineage.write_bytes(df.attrs['collection_lineage_csv_gzip'])
+            ledger_store.write_atomic(lineage, lambda p: p.write_bytes(df.attrs['collection_lineage_csv_gzip']))
         review=Path(DATA_DIR)/(metadata['version']+"-classification.csv.gz")
         if df.attrs.get('collection_classification_csv_gzip') and not review.exists():
-            review.write_bytes(df.attrs['collection_classification_csv_gzip'])
+            ledger_store.write_atomic(review, lambda p: p.write_bytes(df.attrs['collection_classification_csv_gzip']))
     quality=history_quality_summary(df)
     if metadata:
         quality[ledger_metadata.ATTR]=metadata
         quality['valid_rows']=metadata['training_rows']
         quality['data_start_date']=metadata['data_start_date']
         quality['data_end_date']=metadata['data_end_date']
-    prepare_history_frame(df).to_pickle(HISTORY_FILE)
-    with open(HISTORY_QUALITY_FILE,"w",encoding="utf-8") as f:
-        json.dump(quality,f,ensure_ascii=False,indent=2)
+    ledger_store.write_atomic(HISTORY_FILE, prepare_history_frame(df).to_pickle)
+    ledger_store.write_atomic(HISTORY_QUALITY_FILE, lambda p: p.write_text(json.dumps(quality,ensure_ascii=False,indent=2),encoding='utf-8'))
     st.cache_data.clear()
     return quality
 
@@ -2318,6 +2338,8 @@ if mode=="🔧 배포자 관리":
                 missing=[c for c in required if c not in df_new.columns]
                 if missing: st.error(f"필수 컬럼 없음: {missing}")
                 else:
+                    import ledger_store
+                    ledger_store.persist_upload(content, df_new)
                     quality_info=save_history(df_new)
                     df_clean=prepare_history_frame(df_new)
                     target=pd.to_numeric(df_clean["예가/기초(0%)"],errors="coerce")

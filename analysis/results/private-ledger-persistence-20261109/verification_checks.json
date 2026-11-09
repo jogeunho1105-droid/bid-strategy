@@ -1,0 +1,55 @@
+{
+  "automated_tests": {
+    "run": 151,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "excluded_module": "test_v2_15_6: four historical analysis modules absent from repository",
+    "runtime": "Streamlit 1.40.2 / pandas 2.3.3 / numpy 2.5.4"
+  },
+  "private_repository_restore": {
+    "anonymous_repo_status": 404,
+    "empty_local_directory_restore": true,
+    "operational_rows": 112572,
+    "training_rows": 91259,
+    "version": "collection-20261109-supervision-8482",
+    "operational_signature_matches": true,
+    "all_training_prediction_inputs_equal_within_1e_12": true,
+    "lineage_restored": true,
+    "classification_restored": true
+  },
+  "cold_application_ui": {
+    "runtime": "Streamlit1.40.2/pandas2.3.3/numpy2.5.4",
+    "cold_ui_auto_restore": true,
+    "exceptions": 0,
+    "dataframes": 1,
+    "training_rows": 91259,
+    "version_visible": true,
+    "sample_notices": 4,
+    "local_history_created": true
+  },
+  "unchanged_application_functions": 84,
+  "changed_application_functions": [
+    "load_history",
+    "load_history_quality",
+    "save_history"
+  ],
+  "protected_module_sha256": {
+    "bid_engine.py": "20869d602a52700bb38a19382f03cb204c4986bf28acb00260f7520f996d4c54",
+    "bid_rules.py": "2e0f1e8485297bdb85be6722dfd7062bbb683469d1ac821308e210422bfc8f6c",
+    "bid_legacy.py": "b9cf1524811cb03f845f69ad74b3c296824092e5e0d1c551628675a902c144d3",
+    "bid_strategies.py": "e0f36768bcee3d776f721d4fe42a5bee8fa5e10494ea6ea0fa91246fc41c0a62",
+    "model_policy.json": "bc1b5f964c638413f177498d417018942872f97e6f0503023b4ffa9014ba56e5"
+  },
+  "production_secrets_and_reboot": "user confirmed app-specific key configuration; deployment/reboot verification pending",
+  "full_rolling": {
+    "valid_history": 91259,
+    "S1_S5_and_auto_all_periods_families_same_counts": true,
+    "metrics_same_within_1e_12": true,
+    "same_engine_and_policy_hashes": true,
+    "same_day_training": false,
+    "burn_in": 150,
+    "before_seconds": 1863,
+    "after_seconds": 1954
+  }
+}
